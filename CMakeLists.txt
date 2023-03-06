@@ -21,7 +21,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unknown-pragmas -std=gnu++20 
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath,'$ORIGIN/'")
 
-set(SOURCE_FILES main.cpp sniff.cpp tunnel.cpp)
+set(SOURCE_FILES main.cpp sniff.cpp reply.cpp tunnel.cpp)
 
 SET(LIBRARY_OUTPUT_PATH "${tunl_SOURCE_DIR}/${CMAKE_BUILD_TYPE}")
 

@@ -20,11 +20,21 @@ static void print_udp_packet(const std::span<char> buffer);
 static int tcp = 0, udp = 0, icmp = 0, others = 0, igmp = 0, total = 0;
 static auto c_start = std::chrono::high_resolution_clock::now();
 
-int sniff() {
+int sniff(int pipe_out) {
+  const std::string_view fn{__FUNCTION__};
+  fprintf(stderr, "DEBUG: %s(..) invoked\n", fn.data());
+  auto const close_fstream = [](FILE**p) {
+    if (p != nullptr && *p != nullptr) {
+      fclose(*p);
+    }
+  };
+  FILE *fstream_out = fdopen(pipe_out, "wb");
+  std::unique_ptr<FILE*, decltype(close_fstream)> sp_fstream_out{&fstream_out, close_fstream};
+
   auto const cleanup_sockfd = [](const int* p) {
     if (p != nullptr) {
       close(*p);
-      printf("INFO: close(__fd=%d) called\n", *p);
+      fprintf(stderr, "INFO: close(__fd=%d) called\n", *p);
     }
   };
   const int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -53,7 +63,8 @@ int sniff() {
 //      printf("DEBUG: %d = select(..)\n", rc);
       if (rc == 0) {
         if (is_first) {
-          puts("INFO: Got no packets");
+          fputs("INFO: Got no packets\n", fstream_out);
+          fprintf(stderr, "DEBUG: %s(..): Got no packets\n", fn.data());
         }
         break;
       } else if (rc < 0) {
@@ -118,7 +129,7 @@ static void process_packet(const std::span<char> buffer, const int sockfd, const
   const auto diff = std::chrono::duration_cast<std::chrono::seconds>(c_curr - c_start).count();
   if (diff >= 15) { // every 15 seconds print out these totals
     c_start = c_curr;
-    printf("TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n",
+    fprintf(stdout, "TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n",
            tcp, udp, icmp, igmp, others, total);
   }
 }
@@ -145,9 +156,9 @@ static std::string_view icmp_type_to_str(const unsigned int type) {
 static void print_icmp_packet_helper(const struct icmphdr * const icmph, const long sequence) {
   const auto type = static_cast<unsigned int>(icmph->type);
   const auto type_str = icmp_type_to_str(type);
-  printf("ICMP Header | -Type : %u : %s%49c\n", type, type_str.data(), ' ');
+  fprintf(stdout, "ICMP Header | -Type : %u : %s%49c\n", type, type_str.data(), ' ');
   if (type == ICMP_ECHOREPLY) {
-    printf("ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)%29c\n",
+    fprintf(stdout, "ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)%29c\n",
            icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence, ' ');
   }
 }

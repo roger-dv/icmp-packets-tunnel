@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <memory>
 
-int tunnel(int pipe_in, int pipe_out) {
+int reply(int pipe_in) {
   const std::string_view fn{__FUNCTION__};
   fprintf(stderr, "DEBUG: %s(..) invoked\n", fn.data());
   auto const close_fd = [](int *p) {
@@ -15,7 +15,6 @@ int tunnel(int pipe_in, int pipe_out) {
     }
   };
   std::unique_ptr<int, decltype(close_fd)> sp_fd_in{&pipe_in, close_fd};
-  std::unique_ptr<int, decltype(close_fd)> sp_fd_out{&pipe_out, close_fd};
 
   const std::string_view suffix{"(..): "};
   std::array<char, 2048> buf{};
