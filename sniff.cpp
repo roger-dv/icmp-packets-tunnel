@@ -1,5 +1,6 @@
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <cerrno>
 #include <csignal>
 #include <memory>
 #include <span>
@@ -7,8 +8,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
-#include<netinet/udp.h>
-#include<netinet/tcp.h>
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
 #include <sys/un.h>
 
 static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
@@ -23,7 +24,7 @@ static auto c_start = std::chrono::high_resolution_clock::now();
 
 int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   const std::string_view fn{__FUNCTION__};
-  printf("DEBUG: %s(..) invoked\n", fn.data());
+  printf("INFO: %s(..) invoked\n", fn.data());
 
   auto const cleanup_sockfd = [](const int* p) {
     if (p != nullptr) {
@@ -71,7 +72,8 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
 //      printf("DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
       if (rc == 0) {
         if (is_first) {
-          printf("INFO: %s(..): Got no packets\n", fn.data());
+          fprintf(stdout, "INFO: %s(..): Got no packets\n", fn.data());
+          fflush(stdout);
         }
         break;
       } else if (rc < 0) {

@@ -1,10 +1,10 @@
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <cstring>
 #include <array>
-#include <unistd.h>
 #include <memory>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/ip_icmp.h>
 
@@ -14,7 +14,8 @@ static int send_icmp_echo_reply(char * const buf, const size_t packet_size, cons
 
 int reply(int pipe_in) {
   const std::string_view fn{__FUNCTION__};
-  printf("DEBUG: %s(..) invoked\n", fn.data());
+  printf("INFO: %s(..) invoked\n", fn.data());
+
   auto const close_fd = [](int *p) {
     if (p != nullptr) {
       close(*p);
@@ -52,7 +53,7 @@ int reply(int pipe_in) {
 
     struct timeval timeout = {3, 0}; // wait max 3 seconds for a reply
     int rc = select(fd + 1, &read_set, nullptr, nullptr, &timeout);
-    printf("DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
+//    printf("DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
     if (rc == 0) {
       continue;
     } else if (rc < 0) {

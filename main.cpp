@@ -24,7 +24,8 @@ void __assert (const char *__assertion, const char *__file, int __line) __THROW 
 // extern and forward function declarations
 extern int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 extern int reply(int pipe_in);
-extern int tunnel(int pipe_in, int pipe_out, sockaddr_un addr, socklen_t addr_len, const std::string_view dst_net_addr);
+extern int tunnel(int pipe_in, const std::string_view dst_net_addr);
+extern int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 static std::string format2str(const char *const fmt, ...);
 static std::optional<std::string> find_program_path(const std::string_view prog, const std::string_view path_var_name);
 static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename);
@@ -255,16 +256,19 @@ int main(const int argc, const char *argv[]) {
     //  2) tunnel packets to outside world (as piped to and from the child process)
     std::function<int()> wait_on_sniffer_task = wait_on_sniffer;
     std::function<int()> tunnel_task =
-        [pipe_in = socket_fd_sniff_sp.release()->fd, pipe_out = socket_fd_reply_sp.release()->fd,
-            addr = reply_addr, addr_len = reply_addr_len, dst=dst_net_addr.data()] {
-          return tunnel(pipe_in, pipe_out, addr, addr_len, dst);
+        [pipe_in = socket_fd_sniff_sp.release()->fd, dst = dst_net_addr.data()] { return tunnel(pipe_in, dst); };
+    std::function<int()> relay_task =
+        [pipe_out = socket_fd_reply_sp.release()->fd, addr = reply_addr, addr_len = reply_addr_len] {
+          return relay(pipe_out, addr, addr_len);
         };
     std::future<int> fut1 = std::async(std::launch::async, std::move(wait_on_sniffer_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(tunnel_task));
+    std::future<int> fut3 = std::async(std::launch::async, std::move(relay_task));
     // wait on the task futures
     const auto rc1 = fut1.get();
     const auto rc2 = fut2.get();
-    return rc1 == EXIT_SUCCESS ? rc2 : rc1;
+    const auto rc3 = fut2.get();
+    return rc1 == EXIT_SUCCESS ? (rc2 == EXIT_SUCCESS ? rc3 : rc2) : rc1;
   }
 }
 
