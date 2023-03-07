@@ -136,5 +136,10 @@ The delete script:
 # delete the network namespace
 sudo ip netns delete att-tst
 ip netns list
-
 ```
+
+## Compiler used for building `tunl`
+
+The compiler gcc/g++ version 11.3.0 was used to build the `tunl` project. This compiler has good C++17 compliance and has some degree of C++20 (but certainly is not complete).
+
+The `tunl` source code is C++17 compliant except for the use of `std::span`; it proved necessary to set the `-std=gnu++20` compiler option (refer to `CMakeLists.txt`) in order to use `std::span`.
