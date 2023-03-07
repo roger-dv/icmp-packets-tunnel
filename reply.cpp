@@ -5,10 +5,11 @@
 #include <array>
 #include <unistd.h>
 #include <memory>
+#include <sys/socket.h>
 
 int reply(int pipe_in) {
   const std::string_view fn{__FUNCTION__};
-  fprintf(stderr, "DEBUG: %s(..) invoked\n", fn.data());
+  printf("DEBUG: %s(..) invoked\n", fn.data());
   auto const close_fd = [](int *p) {
     if (p != nullptr) {
       close(*p);
@@ -16,16 +17,30 @@ int reply(int pipe_in) {
   };
   std::unique_ptr<int, decltype(close_fd)> sp_fd_in{&pipe_in, close_fd};
 
+  if (listen(pipe_in, 5) == -1) {
+    const auto ec = errno;
+    fprintf(stderr, "ERROR: %s(..): listen(__fd=%d,..): ec=%d; %s\n", fn.data(), pipe_in, ec, strerror(ec));
+    return EXIT_FAILURE;
+  }
+
+  int fd = accept(pipe_in, nullptr, nullptr);
+  if (fd == -1) {
+    const auto ec = errno;
+    fprintf(stderr, "WARN: %s(..): accept(__fd=%d,..): ec=%d; %s\n", fn.data(), pipe_in, ec, strerror(ec));
+    return EXIT_FAILURE;
+  }
+  std::unique_ptr<int, decltype(close_fd)> sp_fd{&fd, close_fd};
+
   const std::string_view suffix{"(..): "};
   std::array<char, 2048> buf{};
   for(;;) {
     fd_set read_set;
     memset(&read_set, 0, sizeof read_set);
-    FD_SET(pipe_in, &read_set);
+    FD_SET(fd, &read_set);
 
     struct timeval timeout = {3, 0}; // wait max 3 seconds for a reply
-    int rc = select(pipe_in + 1, &read_set, nullptr, nullptr, &timeout);
-    fprintf(stderr, "DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
+    int rc = select(fd + 1, &read_set, nullptr, nullptr, &timeout);
+    printf("DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
     if (rc == 0) {
       continue;
     } else if (rc < 0) {
@@ -35,10 +50,10 @@ int reply(int pipe_in) {
       return EXIT_FAILURE;
     }
 
-    rc = read(pipe_in, buf.data(), buf.size());
+    rc = read(fd, buf.data(), buf.size());
     if (rc < 0) {
       const auto ec = errno;
-      fprintf(stderr, "ERROR: %s(..): reading tunnel pipe input failed: %d %s\n", fn.data() , ec, strerror(ec));
+      fprintf(stderr, "ERROR: %s(..): reading tunnel pipe reply input failed: %d %s\n", fn.data() , ec, strerror(ec));
       return EXIT_FAILURE;
     }
     if (rc == 0) break; // eof

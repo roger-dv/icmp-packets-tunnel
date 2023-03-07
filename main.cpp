@@ -20,12 +20,12 @@ void __assert (const char *__assertion, const char *__file, int __line) __THROW 
 #endif
 
 // extern and forward function declarations
-extern int sniff(int pipe_out);
+extern int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 extern int reply(int pipe_in);
-extern int tunnel(int pipe_in, int pipe_out);
+extern int tunnel(int pipe_in, int pipe_out, sockaddr_un addr, socklen_t addr_len);
 static std::string format2str(const char *const fmt, ...);
 static std::optional<std::string> find_program_path(const std::string_view prog, const std::string_view path_var_name);
-static std::string make_fifo_pipe_name(const std::string_view progname, const std::string_view fifo_pipe_basename);
+static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename);
 
 // RAII-related declarations for managing file/pipe descriptors (to clean these up if exception thrown)
 struct fd_wrapper_t {
@@ -37,7 +37,8 @@ struct fd_wrapper_t {
 };
 using fd_wrapper_cleanup_t = void(*)(fd_wrapper_t *);
 using fd_wrapper_sp_t = std::unique_ptr<fd_wrapper_t, fd_wrapper_cleanup_t>;
-static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(const std::string_view uds_socket_name);
+static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(
+    const std::string_view uds_socket_name, sockaddr_un &addr, socklen_t &addr_len, const bool skip_bind = false);
 //static void fd_cleanup_no_delete(fd_wrapper_t *);
 static void fd_cleanup_with_delete(fd_wrapper_t *);
 
@@ -78,6 +79,29 @@ static void one_time_init(int argc, const char *argv[]) {
     }
     s_progname = malloced_tmpstr; // static string_view variable takes ownership for program runtime duration
   }
+
+  static const auto uds_socket_name_sniff = make_uds_socket_name(progname(), "Sniffer_UDS");
+  static const auto uds_socket_name_reply = make_uds_socket_name(progname(), "Replier_UDS");
+
+  auto const sig_handler = [](int sig) {
+    if (sig != SIGINT && sig != SIGTERM) return;
+    std::array<std::string_view, 2> uds_names = { uds_socket_name_sniff, uds_socket_name_reply };
+    for(const auto uds_name : uds_names) {
+      int rc = remove(uds_name.data());
+      if (rc < 0) {
+        const auto ec = errno;
+        if (ec != ENOENT) {
+          fprintf(stderr, "WARN: %s(..): remove(\"%s\"): failed removing UDS socket file path: %d: %s\n",
+                  __FUNCTION__ , uds_name.data(), ec, strerror(ec));
+        }
+      }
+    }
+    _exit(EXIT_SUCCESS);
+  };
+
+  if (signal(SIGINT, sig_handler) != SIG_ERR && signal(SIGTERM, sig_handler) != SIG_ERR) return;
+  __assert("signal() failed to install signal handler", __FILE__, __LINE__);
+  _exit(EXIT_FAILURE); // will exit here if __assert() defined to no-op function
 }
 #pragma clang diagnostic pop
 
@@ -110,14 +134,21 @@ int main(const int argc, const char *argv[]) {
       fputs("ERROR: UDS socket names per options -pipe-sniff or -pipe-reply not detected", stderr);
       return EXIT_FAILURE;
     }
-    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff);
+    sockaddr_un sniff_addr{};
+    socklen_t sniff_addr_len;
+    sockaddr_un reply_addr{};
+    socklen_t reply_addr_len;
+    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff, sniff_addr, sniff_addr_len, true);
     if (!socket_fd_sniff_sp_optn.has_value()) return EXIT_FAILURE;
-    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply);
+    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply, reply_addr, reply_addr_len);
     if (!socket_fd_reply_sp_optn.has_value()) return EXIT_FAILURE;
     auto socket_fd_sniff_sp = std::move(socket_fd_sniff_sp_optn.value());
     auto socket_fd_reply_sp = std::move(socket_fd_reply_sp_optn.value());
 
-    std::function<int()> sniff_task = [pipe_out=socket_fd_sniff_sp.release()->fd] { return sniff(pipe_out); };
+    std::function<int()> sniff_task =
+        [pipe_out = socket_fd_sniff_sp.release()->fd, addr = sniff_addr, addr_len = sniff_addr_len] {
+          return sniff(pipe_out, addr, addr_len);
+        };
     std::function<int()> reply_task = [pipe_in=socket_fd_reply_sp.release()->fd]  { return reply(pipe_in);  };
     std::future<int> fut1 = std::async(std::launch::async, std::move(sniff_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(reply_task));
@@ -133,8 +164,8 @@ int main(const int argc, const char *argv[]) {
   if (ip_path_optn->empty()) return EXIT_FAILURE;
   const auto ip_path = ip_path_optn.value();
 
-  const auto uds_socket_name_sniff = make_fifo_pipe_name(progpath(), "Sniffer_UDS");
-  const auto uds_socket_name_reply = make_fifo_pipe_name(progpath(), "Replier_UDS");
+  const auto uds_socket_name_sniff = make_uds_socket_name(progname(), "Sniffer_UDS");
+  const auto uds_socket_name_reply = make_uds_socket_name(progname(), "Replier_UDS");
 
   const pid_t pid = fork();
   if (pid == -1) {
@@ -142,7 +173,6 @@ int main(const int argc, const char *argv[]) {
     return EXIT_FAILURE;
   } else if (pid == 0) {
     // child process
-
     const char * const ip_prg = strdup(ip_path.data());
     const char * const netns = strdup(arg1.data());
     const char * const child_prg = strdup(progpath());
@@ -179,9 +209,13 @@ int main(const int argc, const char *argv[]) {
       return status == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     };
 
-    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff);
+    sockaddr_un sniff_addr{};
+    socklen_t sniff_addr_len;
+    sockaddr_un reply_addr{};
+    socklen_t reply_addr_len;
+    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff, sniff_addr, sniff_addr_len);
     if (!socket_fd_sniff_sp_optn.has_value()) return EXIT_FAILURE;
-    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply);
+    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply, reply_addr, reply_addr_len, true);
     if (!socket_fd_reply_sp_optn.has_value()) return EXIT_FAILURE;
     auto socket_fd_sniff_sp = std::move(socket_fd_sniff_sp_optn.value());
     auto socket_fd_reply_sp = std::move(socket_fd_reply_sp_optn.value());
@@ -191,8 +225,10 @@ int main(const int argc, const char *argv[]) {
     //  2) tunnel packets to outside world (as piped to and from the child process)
     std::function<int()> wait_on_sniffer_task = wait_on_sniffer;
     std::function<int()> tunnel_task =
-        [pipe_in=socket_fd_sniff_sp.release()->fd, pipe_out=socket_fd_reply_sp.release()->fd]
-        { return tunnel(pipe_in, pipe_out); };
+        [pipe_in = socket_fd_sniff_sp.release()->fd, pipe_out = socket_fd_reply_sp.release()->fd,
+            addr = reply_addr, addr_len = reply_addr_len] {
+          return tunnel(pipe_in, pipe_out, addr, addr_len);
+        };
     std::future<int> fut1 = std::async(std::launch::async, std::move(wait_on_sniffer_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(tunnel_task));
     // wait on the task futures
@@ -269,36 +305,17 @@ static std::optional<std::string> find_program_path(const std::string_view prog,
   return std::nullopt;
 }
 
-static volatile unsigned int seed = static_cast<unsigned>(time(nullptr));
-
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "ConstantParameter"
-static int get_rnd_nbr(const unsigned int min_n, const unsigned int max_n) {
-  auto this_seed = seed;
-  auto rnd_n = rand_r(&this_seed);
-  const unsigned int range = 1 + max_n - min_n;
-  const unsigned int buckets = RAND_MAX / range;
-  const decltype(rnd_n) limit = buckets * range;
-  while (rnd_n >= limit) {
-    rnd_n = rand_r(&this_seed);
-  }
-  seed = this_seed;
-  return min_n + rnd_n / buckets;
-}
-#pragma clang diagnostic pop
-
 //
-// Utility function that makes a fifo pipe name
+// Utility function that makes a UDS (Unix Domain) socket name
 //
-static std::string make_fifo_pipe_name(const std::string_view progname, const std::string_view fifo_pipe_basename) {
+static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename) {
   const auto pid = getpid();
   int strbuf_size = 256;
   char *strbuf = reinterpret_cast<char *>(alloca(strbuf_size));
   do_msg_fmt:
   {
     int n = strbuf_size;
-    n = snprintf(strbuf, static_cast<size_t>(n), "%s/%s_%s_%d_%d",
-                 "/tmp", progname.data(), fifo_pipe_basename.data(), pid, get_rnd_nbr(1, 99));
+    n = snprintf(strbuf, static_cast<size_t>(n), "%s/%s_%s", "/tmp", progname.data(), fifo_pipe_basename.data());
     if (n <= 0) {
       fprintf(stderr, "ERROR: %s() process %d Failed synthesizing FIFO_PIPE name string", __FUNCTION__, pid);
       return "";
@@ -310,14 +327,7 @@ static std::string make_fifo_pipe_name(const std::string_view progname, const st
   }
   return strbuf;
 }
-/*
-static void fd_cleanup_no_delete(fd_wrapper_t *p) {
-  if (p != nullptr && p->fd != -1) {
-    close(p->fd);
-    p->fd = -1;
-  }
-}
-*/
+
 static void fd_cleanup_with_delete(fd_wrapper_t *p) {
   if (p != nullptr && p->fd != -1) {
     close(p->fd);
@@ -327,7 +337,7 @@ static void fd_cleanup_with_delete(fd_wrapper_t *p) {
 }
 
 static int create_uds_socket() {
-  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
     const auto ec = errno;
     fprintf(stderr, "ERROR: socket(..): failed create UDS socket: ec=%d; %s\n", ec, strerror(ec));
@@ -341,24 +351,62 @@ static void init_sockaddr(const std::string_view uds_sock_name, sockaddr_un &add
   auto const path_buf_end = sizeof(addr.sun_path) - 1;
   strncpy(addr.sun_path, uds_sock_name.data(), path_buf_end);
   addr.sun_path[path_buf_end] = '\0';
-  addr.sun_path[0] = '\0';
-  addr_len = sizeof(sockaddr_un) - (sizeof(addr.sun_path) - uds_sock_name.size());
+  addr_len = offsetof(struct sockaddr_un, sun_path) + strlen(addr.sun_path) + 1;
 }
 
-static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(const std::string_view uds_socket_name) {
+static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(
+    const std::string_view uds_socket_name, sockaddr_un &addr, socklen_t &addr_len, const bool skip_bind)
+{
+  const std::string_view fn{__FUNCTION__};
+
+  // create the socket
   const int fd = create_uds_socket();
   if (fd < 0) return std::nullopt;
   fd_wrapper_sp_t socket_fd_sp{ new fd_wrapper_t{ fd }, fd_cleanup_with_delete };
 
-  sockaddr_un server_address{};
-  socklen_t address_length;
-  init_sockaddr(uds_socket_name, server_address, address_length);
+  init_sockaddr(uds_socket_name, addr, addr_len);
+  fprintf(stderr, "DEBUG: %s(..): UDS socket name: \"%s\"\n", fn.data(), addr.sun_path);
 
-  int rc = bind(socket_fd_sp->fd, reinterpret_cast<const sockaddr*>(&server_address), address_length);
-  if (rc < 0) {
-    const auto ec = errno;
-    fprintf(stderr, "ERROR: failed binding UDS socket for i/o: %d: %s", ec, strerror(ec));
-    return std::nullopt;
+  if (!skip_bind) {
+    int rc;
+    // restrict permissions
+#ifdef __linux__
+    rc = fchmod(socket_fd_sp->fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH | S_IXOTH);
+    if (rc < 0) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: %s(..): fchmod(__fd=%d,..): failed setting permissions: %d: %s\n",
+              fn.data(), socket_fd_sp->fd, ec, strerror(ec));
+      return std::nullopt;
+    }
+#endif
+
+    rc = remove(addr.sun_path);
+    if (rc < 0) {
+      const auto ec = errno;
+      if (ec != ENOENT) {
+        fprintf(stderr, "ERROR: %s(..): remove(\"%s\"): failed removing UDS socket file path: %d: %s\n",
+                fn.data(), addr.sun_path, ec, strerror(ec));
+        return std::nullopt;
+      }
+    }
+
+    // bind the socket now
+    rc = bind(socket_fd_sp->fd, reinterpret_cast<const sockaddr *>(&addr), addr_len);
+    if (rc < 0) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: %s(..): bind(__fd=%d,..): failed binding UDS socket for i/o: %d: %s\n",
+              fn.data(), socket_fd_sp->fd, ec, strerror(ec));
+      return std::nullopt;
+    }
+
+    // finally, fix the permissions to one's liking
+    rc = chmod(addr.sun_path, 0666);  // <- change 0666 to what your permissions need to be
+    if (rc < 0) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: %s(..): chmod(\"%s\",..): failed setting permissions: %d: %s\n",
+              fn.data(), addr.sun_path, ec, strerror(ec));
+      return std::nullopt;
+    }
   }
 
   return std::make_optional<fd_wrapper_sp_t>(std::move(socket_fd_sp));

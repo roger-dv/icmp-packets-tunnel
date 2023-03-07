@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <csignal>
 #include <memory>
-#include <cstring>
 #include <span>
 #include <chrono>
 #include <sys/socket.h>
@@ -10,33 +9,42 @@
 #include <netinet/ip_icmp.h>
 #include<netinet/udp.h>
 #include<netinet/tcp.h>
+#include <sys/un.h>
 
-static void process_packet(const std::span<char> buffer, const int sockfd, const int packet_size, const long sequence);
-static void print_icmp_packet_helper(const struct icmphdr * const icmph, const long sequence);
-static void print_icmp_packet(const std::span<char> buffer, const long sequence);
+static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
+                          const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out);
+static int print_icmp_packet(const long sequence, const std::span<char> buffer, const size_t packet_size,
+                             const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out);
 static void print_tcp_packet(const std::span<char> buffer);
 static void print_udp_packet(const std::span<char> buffer);
 
 static int tcp = 0, udp = 0, icmp = 0, others = 0, igmp = 0, total = 0;
 static auto c_start = std::chrono::high_resolution_clock::now();
 
-int sniff(int pipe_out) {
+int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   const std::string_view fn{__FUNCTION__};
-  fprintf(stderr, "DEBUG: %s(..) invoked\n", fn.data());
-  auto const close_fstream = [](FILE**p) {
-    if (p != nullptr && *p != nullptr) {
-      fclose(*p);
-    }
-  };
-  FILE *fstream_out = fdopen(pipe_out, "wb");
-  std::unique_ptr<FILE*, decltype(close_fstream)> sp_fstream_out{&fstream_out, close_fstream};
+  printf("DEBUG: %s(..) invoked\n", fn.data());
 
   auto const cleanup_sockfd = [](const int* p) {
     if (p != nullptr) {
       close(*p);
-      fprintf(stderr, "INFO: close(__fd=%d) called\n", *p);
+      printf("INFO: close(__fd=%d) called\n", *p);
     }
   };
+
+  std::unique_ptr<const int, decltype(cleanup_sockfd)> sp_pipe_out_fd{&pipe_out, cleanup_sockfd};
+
+  for(;;) {
+    if (connect(pipe_out, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == -1) {
+      const auto ec = errno;
+      fprintf(stderr, "WARN: %s(..): connect(__fd=%d,addr=\"%s\",..): ec=%d; %s\n",
+              fn.data(), pipe_out, addr.sun_path, ec, strerror(ec));
+      sleep(3);
+      continue;
+    }
+    break;
+  }
+
   const int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
   if (sockfd < 0) {
     const auto ec = errno;
@@ -63,8 +71,7 @@ int sniff(int pipe_out) {
 //      printf("DEBUG: %d = select(..)\n", rc);
       if (rc == 0) {
         if (is_first) {
-          fputs("INFO: Got no packets\n", fstream_out);
-          fprintf(stderr, "DEBUG: %s(..): Got no packets\n", fn.data());
+          printf("INFO: %s(..): Got no packets\n", fn.data());
         }
         break;
       } else if (rc < 0) {
@@ -77,16 +84,20 @@ int sniff(int pipe_out) {
         return EXIT_FAILURE;
       }
 
-      // we don't care about the sender address in this situation...
+      sockaddr src_addr;
+      memset(&src_addr, 0, sizeof src_addr);
+      socklen_t src_addr_len = 0;
       memset(data.data(), 0, sizeof(struct icmphdr));
-      rc = recvfrom(sockfd, data.data(), data.size(), 0, nullptr, nullptr);
+      rc = recvfrom(sockfd, data.data(), data.size(), 0, &src_addr, &src_addr_len);
 //      printf("DEBUG: %d = recvfrom(..)\n", rc);
       if (rc < 0) { // check and handle error condition
         const auto ec = errno;
         fprintf(stderr, "ERROR: recvfrom(__fd=%d,..): ec=%d; %s\n", sockfd, ec, strerror(ec));
         return EXIT_FAILURE;
       } else if (rc != 0) {
-        process_packet(data, sockfd, rc, sequence);
+        if (process_packet(sequence, data, rc, sockfd, src_addr, src_addr_len, pipe_out) != EXIT_SUCCESS) {
+          return EXIT_FAILURE;
+        }
       }
       timeout = {0, 250}; // now wait quarter of a second on select()
       is_first = false;
@@ -96,7 +107,10 @@ int sniff(int pipe_out) {
   return EXIT_SUCCESS;
 }
 
-static void process_packet(const std::span<char> buffer, const int sockfd, const int packet_size, const long sequence) {
+static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
+                          const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out)
+{
+  int rc = EXIT_SUCCESS;
   //Get the IP Header part of this packet
   const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(buffer.data());
   ++total;
@@ -104,10 +118,11 @@ static void process_packet(const std::span<char> buffer, const int sockfd, const
     case 1:  // ICMP Protocol
       ++icmp;
       if (static_cast<size_t>(packet_size) < sizeof(struct icmphdr)) { // check for truncated packet (would be unexpected)
-        fprintf(stderr, "ERROR: recvfrom(__fd=%d,..): got short ICMP packet - %d bytes (expected 'struct icmphdr' %u bytes)\n",
+        fprintf(stderr, "ERROR: recvfrom(__fd=%d,..): got short ICMP packet - %lu bytes (expected 'struct icmphdr' %u bytes)\n",
                 sockfd, packet_size, static_cast<unsigned int>(sizeof(struct icmphdr)));
+      } else {
+        rc = print_icmp_packet(sequence, buffer, packet_size, src_addr, src_addr_len, pipe_out);
       }
-      print_icmp_packet(buffer, sequence);
       break;
     case 2:  // IGMP Protocol
       ++igmp;
@@ -132,6 +147,8 @@ static void process_packet(const std::span<char> buffer, const int sockfd, const
     fprintf(stdout, "TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n",
            tcp, udp, icmp, igmp, others, total);
   }
+
+  return rc;
 }
 
 static std::string_view icmp_type_to_str(const unsigned int type) {
@@ -153,21 +170,39 @@ static std::string_view icmp_type_to_str(const unsigned int type) {
   }
 }
 
-static void print_icmp_packet_helper(const struct icmphdr * const icmph, const long sequence) {
+static int print_icmp_packet(const long sequence, const std::span<char> buffer, const size_t packet_size,
+                             const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out)
+{
+  const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(buffer.data());
+  const unsigned short iphdrlen = iph->ihl * 4;
+  const struct icmphdr * const icmph = reinterpret_cast<struct icmphdr *>(buffer.data() + iphdrlen);
   const auto type = static_cast<unsigned int>(icmph->type);
   const auto type_str = icmp_type_to_str(type);
   fprintf(stdout, "ICMP Header | -Type : %u : %s%49c\n", type, type_str.data(), ' ');
   if (type == ICMP_ECHOREPLY) {
     fprintf(stdout, "ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)%29c\n",
-           icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence, ' ');
+            icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence, ' ');
+  } else if (type == ICMP_ECHO) {
+    auto const prn_err = [](int fd, int ec) {
+      fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, fd, ec, strerror(ec));
+    };
+    struct {
+      const socklen_t addr_len;
+      const sockaddr addr;
+      const size_t packet_size;
+    } addr_buf{src_addr_len, src_addr, packet_size};
+    int rc = write(pipe_out, &addr_buf, sizeof(addr_buf));
+    if (rc < 0) {
+      prn_err(pipe_out, errno);
+      return EXIT_FAILURE;
+    }
+    rc = write(pipe_out, buffer.data(), packet_size);
+    if (rc < 0) {
+      prn_err(pipe_out, errno);
+      return EXIT_FAILURE;
+    }
   }
-}
-
-static void print_icmp_packet(const std::span<char> buffer, const long sequence) {
-  const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(buffer.data());
-  const unsigned short iphdrlen = iph->ihl * 4;
-  const struct icmphdr * const icmph = reinterpret_cast<struct icmphdr *>(buffer.data() + iphdrlen);
-  print_icmp_packet_helper(icmph, sequence);
+  return EXIT_SUCCESS;
 }
 
 static void print_tcp_packet(const std::span<char> buffer) {
