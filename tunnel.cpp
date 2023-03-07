@@ -10,8 +10,9 @@
 #include <arpa/inet.h>
 #include <netinet/ip_icmp.h>
 
-static int send_icmp_echo(const int pipe_out, const int dst_sockfd, const int rcv_dst_sockfd,
+static int send_icmp_echo(const int pipe_out, const int dst_sockfd, const int datasize,
                           char * const buf, const size_t packet_size, const sockaddr_in &dst_addr);
+static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len);
 
 int tunnel(int pipe_in, int pipe_out, sockaddr_un addr, socklen_t addr_len, const std::string_view dst_net_addr) {
   const std::string_view fn{__FUNCTION__};
@@ -212,28 +213,35 @@ static int send_icmp_echo(const int pipe_out, const int dst_sockfd, const int rc
         fprintf(stderr, "ERROR: %s(..): got short ICMP packet: %d bytes (expected %lu bytes)\n",
                 fn.data(), rc, sizeof(struct icmphdr));
       } else {
-        auto const prn_err = [](int fd, int ec) {
-          fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, fd, ec, strerror(ec));
-        };
-        struct {
-          const socklen_t addr_len;
-          const sockaddr addr;
-          const size_t packet_size;
-        } addr_buf{src_addr_len, src_addr, static_cast<size_t>(rc)};
-        int n = write(pipe_out, &addr_buf, sizeof(addr_buf));
-        if (n < 0) {
-          prn_err(pipe_out, errno);
-          return EXIT_FAILURE;
-        }
-        n = write(pipe_out, data.data(), rc);
-        if (n < 0) {
-          prn_err(pipe_out, errno);
-          return EXIT_FAILURE;
+        if (write_packet(pipe_out, data.data(), rc, src_addr, src_addr_len) != EXIT_SUCCESS) {
+          return EXIT_SUCCESS;
         }
       }
     }
     timeout = {0, 60}; // now wait quarter of a second on select()
     is_first = false;
+  }
+
+  return EXIT_SUCCESS;
+}
+
+static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len) {
+  struct {
+    const socklen_t addr_len;
+    const sockaddr addr;
+    const size_t packet_size;
+  } addr_buf{addr_len, addr, datasize};
+
+  const size_t total_buf_size = sizeof addr_buf + datasize;
+  char * const buf = reinterpret_cast<char*>(alloca(total_buf_size));
+  memcpy(buf, &addr_buf, sizeof addr_buf);
+  memcpy(buf + sizeof addr_buf, data, datasize);
+
+  int n = write(fd, buf, total_buf_size);
+  if (n < 0) {
+    const auto ec = errno;
+    fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, fd, ec, strerror(ec));
+    return EXIT_FAILURE;
   }
 
   return EXIT_SUCCESS;

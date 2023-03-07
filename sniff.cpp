@@ -179,29 +179,30 @@ static int print_icmp_packet(const long sequence, const std::span<char> buffer, 
   const auto type = static_cast<unsigned int>(icmph->type);
   const auto type_str = icmp_type_to_str(type);
   fprintf(stdout, "INFO: sniff: ICMP Header | -Type : %u : %s\n", type, type_str.data());
+
   if (type == ICMP_ECHOREPLY) {
     fprintf(stdout, "INFO: sniff: ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)\n",
             icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence);
   } else if (type == ICMP_ECHO) {
-    auto const prn_err = [](int fd, int ec) {
-      fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, fd, ec, strerror(ec));
-    };
     struct {
       const socklen_t addr_len;
       const sockaddr addr;
       const size_t packet_size;
     } addr_buf{src_addr_len, src_addr, packet_size};
-    int rc = write(pipe_out, &addr_buf, sizeof(addr_buf));
+
+    const size_t total_buf_size = sizeof addr_buf + packet_size;
+    char * const buf = reinterpret_cast<char*>(alloca(total_buf_size));
+    memcpy(buf, &addr_buf, sizeof addr_buf);
+    memcpy(buf + sizeof addr_buf, buffer.data(), packet_size);
+
+    int rc = write(pipe_out, buf, total_buf_size);
     if (rc < 0) {
-      prn_err(pipe_out, errno);
-      return EXIT_FAILURE;
-    }
-    rc = write(pipe_out, buffer.data(), packet_size);
-    if (rc < 0) {
-      prn_err(pipe_out, errno);
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, pipe_out, ec, strerror(ec));
       return EXIT_FAILURE;
     }
   }
+
   return EXIT_SUCCESS;
 }
 
