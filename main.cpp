@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
 
 //#undef NDEBUG // uncomment this line to enable asserts in use below
 #include <cassert>
@@ -22,7 +24,7 @@ void __assert (const char *__assertion, const char *__file, int __line) __THROW 
 // extern and forward function declarations
 extern int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 extern int reply(int pipe_in);
-extern int tunnel(int pipe_in, int pipe_out, sockaddr_un addr, socklen_t addr_len);
+extern int tunnel(int pipe_in, int pipe_out, sockaddr_un addr, socklen_t addr_len, const std::string_view dst_net_addr);
 static std::string format2str(const char *const fmt, ...);
 static std::optional<std::string> find_program_path(const std::string_view prog, const std::string_view path_var_name);
 static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename);
@@ -107,7 +109,9 @@ static void one_time_init(int argc, const char *argv[]) {
 
 int main(const int argc, const char *argv[]) {
   one_time_init(argc, argv);
-  auto const prn_usage = [prg=progname()] { printf("Usage: %s [-sniff|netns_name]\n", prg.data()); };
+  auto const prn_usage = [prg=progname()] {
+    printf("Usage: %s [-sniff|netns_name] [-ping] destination_ip]\n", prg.data());
+  };
 
   if (argc < 2) {
     prn_usage();
@@ -158,6 +162,32 @@ int main(const int argc, const char *argv[]) {
     const auto rc2 = fut2.get();
 
     return rc1 == EXIT_SUCCESS ? rc2 : rc1;
+  }
+
+  std::string_view dst_net_addr{""};
+  {
+    for(int i = 2; i < argc; i++) {
+      const std::string_view arg{argv[i]};
+      if (arg == "-ping") {
+        const int j = i + 1;
+        if (j >= argc) {
+          fputs("ERROR: -ping option missing destination IPv4 address argument\n", stderr);
+          return EXIT_FAILURE;
+        }
+        dst_net_addr = argv[j];
+        struct in_addr dst;
+        memset(&dst, 0, sizeof dst);
+        if (inet_aton(dst_net_addr.data(), &dst) == 0) {
+          fprintf(stderr, "ERROR: inet_aton(__cp=\"%s\"): isn't a valid destination IP address\n", dst_net_addr.data());
+          return EXIT_FAILURE;
+        }
+        i = j;
+      }
+    }
+    if (dst_net_addr.empty()) {
+      fputs("ERROR: destination IP address not specified", stderr);
+      return EXIT_FAILURE;
+    }
   }
 
   auto ip_path_optn = find_program_path("ip", "PATH");
@@ -226,8 +256,8 @@ int main(const int argc, const char *argv[]) {
     std::function<int()> wait_on_sniffer_task = wait_on_sniffer;
     std::function<int()> tunnel_task =
         [pipe_in = socket_fd_sniff_sp.release()->fd, pipe_out = socket_fd_reply_sp.release()->fd,
-            addr = reply_addr, addr_len = reply_addr_len] {
-          return tunnel(pipe_in, pipe_out, addr, addr_len);
+            addr = reply_addr, addr_len = reply_addr_len, dst=dst_net_addr.data()] {
+          return tunnel(pipe_in, pipe_out, addr, addr_len, dst);
         };
     std::future<int> fut1 = std::async(std::launch::async, std::move(wait_on_sniffer_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(tunnel_task));
