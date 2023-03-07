@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <array>
+#include <string_view>
 #include <memory>
 #include <unistd.h>
 #include <sys/un.h>

@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <array>
+#include <string_view>
 #include <memory>
 #include <unistd.h>
 #include <sys/socket.h>

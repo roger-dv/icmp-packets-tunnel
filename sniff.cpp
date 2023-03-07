@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <csignal>
+#include <string_view>
 #include <memory>
 #include <span>
 #include <chrono>
