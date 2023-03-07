@@ -99,7 +99,7 @@ int reply(int pipe_in) {
           pcurr_buff += addr_buf.packet_size;
           bytes_rem -= addr_buf.packet_size;
         } else {
-          fprintf(stderr, "WARN: %s(..): received ICMP ECHO packet not of expected size: %lu (actual: %d)\n",
+          fprintf(stderr, "WARN: %s(..): received ICMP packet not of expected size: %lu (actual: %d)\n",
                   fn.data(), addr_buf.packet_size, bytes_rem);
         }
       } while (bytes_rem > 0);

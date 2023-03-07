@@ -9,6 +9,7 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 
+extern std::string_view icmp_type_to_str(const unsigned int type);
 static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len);
 
 int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
@@ -84,12 +85,19 @@ int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
                 strerror(ec));
         return EXIT_FAILURE;
       } else if (rc != 0) {
-        if (static_cast<size_t>(rc) < sizeof(struct icmphdr)) {
-          fprintf(stderr, "ERROR: %s(..): got short ICMP packet: %d bytes (expected %lu bytes)\n",
-                  fn.data(), rc, sizeof(struct icmphdr));
+        if (static_cast<size_t>(rc) < sizeof(struct iphdr)) {
+          fprintf(stderr, "WARN: %s(..): got too short raw packet: %d bytes (expected minimum iphdr %lu bytes)\n",
+                  fn.data(), rc, sizeof(struct iphdr));
         } else {
-          if (write_packet(pipe_out, data.data(), rc, src_addr, src_addr_len) != EXIT_SUCCESS) {
-            return EXIT_SUCCESS;
+          const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(data.data());
+          const unsigned short icmp_pck_len = iph->ihl * 4 + sizeof(struct icmphdr);
+          if (rc < icmp_pck_len) {
+            fprintf(stderr, "WARN: %s(..): got too short ICMP packet: %d bytes (expected minimum %u bytes)\n",
+                    fn.data(), rc, icmp_pck_len);
+          } else {
+            if (write_packet(pipe_out, data.data(), rc, src_addr, src_addr_len) != EXIT_SUCCESS) {
+              return EXIT_FAILURE;
+            }
           }
         }
       }
@@ -102,6 +110,13 @@ int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
 }
 
 static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len) {
+  const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(data);
+  const unsigned short iphdrlen = iph->ihl * 4;
+  const struct icmphdr * const icmph = reinterpret_cast<struct icmphdr *>(data + iphdrlen);
+  const auto type = static_cast<unsigned int>(icmph->type);
+  const auto type_str = icmp_type_to_str(type);
+  if (type_str == "unknown")  return EXIT_SUCCESS; // skip relay of packets that don't appear to be ICMP
+
   struct {
     const socklen_t addr_len;
     const sockaddr addr;

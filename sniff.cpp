@@ -96,9 +96,21 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
         const auto ec = errno;
         fprintf(stderr, "ERROR: %s(..): recvfrom(__fd=%d,..): ec=%d; %s\n", fn.data(), sockfd, ec, strerror(ec));
         return EXIT_FAILURE;
-      } else if (rc != 0) {
-        if (process_packet(sequence, data, rc, sockfd, src_addr, src_addr_len, pipe_out) != EXIT_SUCCESS) {
-          return EXIT_FAILURE;
+      } else if (rc > 0) {
+        if (static_cast<size_t>(rc) < sizeof(struct iphdr)) {
+          fprintf(stderr, "WARN: %s(..): got too short raw packet: %d bytes (expected minimum iphdr %lu bytes)\n",
+                  fn.data(), rc, sizeof(struct iphdr));
+        } else {
+          const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(data.data());
+          const unsigned short icmp_pck_len = iph->ihl * 4 + sizeof(struct icmphdr);
+          if (rc < icmp_pck_len) {
+            fprintf(stderr, "WARN: %s(..): got too short ICMP packet: %d bytes (expected minimum %u bytes)\n",
+                    fn.data(), rc, icmp_pck_len);
+          } else {
+            if (process_packet(sequence, data, rc, sockfd, src_addr, src_addr_len, pipe_out) != EXIT_SUCCESS) {
+              return EXIT_FAILURE;
+            }
+          }
         }
       }
       timeout = {0, 250}; // now wait quarter of a second on select()
