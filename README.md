@@ -1,5 +1,12 @@
 # Tunl
 
+Program author: Roger D. Voss  
+github username: roger-dv  
+  
+Copyright 2023 Roger D. Voss  
+Source code of this project is under Apache License, Version 2.0
+
+
 The program `tunl` is an exercise in network raw packet routing (via tunneling between two different network context).
 
 The program is launched in the default network environment, then it calls `fork()` to establish a child process, which proceeds to call `execv(..)`. The exec call command line is effectively like so:
