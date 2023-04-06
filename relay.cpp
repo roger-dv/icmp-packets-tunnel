@@ -32,6 +32,8 @@ limitations under the License.
 extern std::string_view icmp_type_to_str(const unsigned int type);
 static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len);
 
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "UnusedParameter"
 int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   const std::string_view fn{__FUNCTION__};
   printf("INFO: %s(..) invoked\n", fn.data());
@@ -128,6 +130,7 @@ int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
 
   return EXIT_SUCCESS;
 }
+#pragma clang diagnostic pop
 
 static int write_packet(const int fd, char *data, const size_t datasize, const sockaddr& addr, const socklen_t addr_len) {
   const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(data);

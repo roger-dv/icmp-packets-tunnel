@@ -42,6 +42,8 @@ static void print_udp_packet(const std::span<char> buffer);
 static int tcp = 0, udp = 0, icmp = 0, others = 0, igmp = 0, total = 0;
 static auto c_start = std::chrono::high_resolution_clock::now();
 
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "UnusedParameter"
 int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   const std::string_view fn{__FUNCTION__};
   printf("INFO: %s(..) invoked\n", fn.data());
@@ -140,6 +142,7 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
 
   return EXIT_SUCCESS;
 }
+#pragma clang diagnostic pop
 
 static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
                           const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out)

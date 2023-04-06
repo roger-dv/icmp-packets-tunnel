@@ -90,40 +90,38 @@ int reply(int pipe_in) {
       return EXIT_FAILURE;
     }
     if (rc == 0) break; // eof
-    if (rc > 0) {
-      struct {
-        socklen_t addr_len;
-        sockaddr addr;
-        size_t packet_size;
-      } addr_buf;
+    struct {
+      socklen_t addr_len;
+      sockaddr addr;
+      size_t packet_size;
+    } addr_buf;
+    char *pcurr_buff = buf.data();
+    int bytes_rem = rc;
+    do {
+      const int bytes_amt = bytes_rem;
+      if (static_cast<size_t>(bytes_rem) >= sizeof addr_buf) {
+        memcpy(&addr_buf, pcurr_buff, sizeof addr_buf);
+        pcurr_buff += sizeof addr_buf;
+        bytes_rem -= sizeof addr_buf;
+        const int sa_data_size = static_cast<int>(sizeof(addr_buf.addr.sa_data));
+        printf("DEBUG: %s(..): struct addr_buf: addr_len: %u, addr.sa_data: \"%.*s\", data packet_size: %lu\n",
+               fn.data(), addr_buf.addr_len, sa_data_size, addr_buf.addr.sa_data, addr_buf.packet_size);
+      }
+      printf("DEBUG: %s(..): struct addr_buf size: %lu, packet bytes received: %d, remaining bytes: %d\n",
+             fn.data(), sizeof addr_buf, bytes_amt, bytes_rem);
 
-      char *pcurr_buff = buf.data();
-      int bytes_rem = rc;
-      do {
-        const int bytes_amt = bytes_rem;
-        if (static_cast<size_t>(bytes_rem) >= sizeof addr_buf) {
-          memcpy(&addr_buf, pcurr_buff, sizeof addr_buf);
-          pcurr_buff += sizeof addr_buf;
-          bytes_rem -= sizeof addr_buf;
-          const int sa_data_size = static_cast<int>(sizeof(addr_buf.addr.sa_data));
-          printf("DEBUG: %s(..): struct addr_buf: addr_len: %u, addr.sa_data: \"%.*s\", data packet_size: %lu\n",
-                 fn.data(), addr_buf.addr_len, sa_data_size, addr_buf.addr.sa_data, addr_buf.packet_size);
+      if (static_cast<size_t>(bytes_rem) >= addr_buf.packet_size) {
+        if (send_icmp_echo_reply(pcurr_buff, addr_buf.packet_size, dst_sockfd, addr_buf.addr, addr_buf.addr_len) !=
+            EXIT_SUCCESS) {
+          return EXIT_FAILURE;
         }
-        printf("DEBUG: %s(..): struct addr_buf size: %lu, packet bytes received: %d, remaining bytes: %d\n",
-               fn.data(), sizeof addr_buf, bytes_amt, bytes_rem);
-
-        if (static_cast<size_t>(bytes_rem) >= addr_buf.packet_size) {
-          if (send_icmp_echo_reply(pcurr_buff, addr_buf.packet_size, dst_sockfd, addr_buf.addr, addr_buf.addr_len) != EXIT_SUCCESS) {
-            return EXIT_FAILURE;
-          }
-          pcurr_buff += addr_buf.packet_size;
-          bytes_rem -= addr_buf.packet_size;
-        } else {
-          fprintf(stderr, "WARN: %s(..): received ICMP packet not of expected size: %lu (actual: %d)\n",
-                  fn.data(), addr_buf.packet_size, bytes_rem);
-        }
-      } while (bytes_rem > 0);
-    }
+        pcurr_buff += addr_buf.packet_size;
+        bytes_rem -= addr_buf.packet_size;
+      } else {
+        fprintf(stderr, "WARN: %s(..): received ICMP packet not of expected size: %lu (actual: %d)\n",
+                fn.data(), addr_buf.packet_size, bytes_rem);
+      }
+    } while (bytes_rem > 0);
   }
 
   return EXIT_SUCCESS;

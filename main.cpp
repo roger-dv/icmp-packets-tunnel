@@ -51,11 +51,14 @@ static std::string make_uds_socket_name(const std::string_view progname, const s
 
 // RAII-related declarations for managing file/pipe descriptors (to clean these up if exception thrown)
 struct fd_wrapper_t {
-  pid_t const pid;
-  int fd;
-  std::string const name;
-  explicit fd_wrapper_t(int fd) : pid{0}, fd{fd}, name{} {}
+  pid_t const pid = 0;
+  int fd = 0;
+  std::string const name{};
+  explicit fd_wrapper_t(int fd) : fd{fd} {}
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "UnusedValue"
   explicit fd_wrapper_t(int fd, const char * const name) : pid{ ::getpid() }, fd{fd}, name{name} {}
+#pragma clang diagnostic pop
 };
 using fd_wrapper_cleanup_t = void(*)(fd_wrapper_t *);
 using fd_wrapper_sp_t = std::unique_ptr<fd_wrapper_t, fd_wrapper_cleanup_t>;
@@ -76,6 +79,8 @@ __attribute__((noinline)) const std::string_view progname() { return s_progname;
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "LocalValueEscapesScope"
 #pragma ide diagnostic ignored "UnreachableCode"
+#pragma ide diagnostic ignored "UnusedValue"
+#pragma ide diagnostic ignored "UnusedParameter"
 static void one_time_init(int argc, const char *argv[]) {
   s_parent_thrd_pid = getpid();
 
