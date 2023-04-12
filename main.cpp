@@ -24,14 +24,13 @@ limitations under the License.
 #include <functional>
 #include <future>
 #include <sys/wait.h>
-#include <cstdarg>
 #include <sys/stat.h>
 #include <optional>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/ip.h>
 #include <arpa/inet.h>
+#include <sys/mount.h>
 
 //#undef NDEBUG // uncomment this line to enable asserts in use below
 #include <cassert>
@@ -45,36 +44,29 @@ extern int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 extern int reply(int pipe_in);
 extern int tunnel(int pipe_in, const std::string_view dst_net_addr);
 extern int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len);
-static std::string format2str(const char *const fmt, ...);
-static std::optional<std::string> find_program_path(const std::string_view prog, const std::string_view path_var_name);
-static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename);
+static std::string make_uds_socket_name(const std::string_view prg_name, const std::string_view fifo_pipe_basename);
 
 // RAII-related declarations for managing file/pipe descriptors (to clean these up if exception thrown)
 struct fd_wrapper_t {
-  pid_t const pid = 0;
-  int fd = 0;
-  std::string const name{};
+  int fd;
+  fd_wrapper_t() = delete;
   explicit fd_wrapper_t(int fd) : fd{fd} {}
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "UnusedValue"
-  explicit fd_wrapper_t(int fd, const char * const name) : pid{ ::getpid() }, fd{fd}, name{name} {}
-#pragma clang diagnostic pop
 };
 using fd_wrapper_cleanup_t = void(*)(fd_wrapper_t *);
 using fd_wrapper_sp_t = std::unique_ptr<fd_wrapper_t, fd_wrapper_cleanup_t>;
 static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(
     const std::string_view uds_socket_name, sockaddr_un &addr, socklen_t &addr_len, const bool skip_bind = false);
-//static void fd_cleanup_no_delete(fd_wrapper_t *);
-static void fd_cleanup_with_delete(fd_wrapper_t *);
 
 // static data definitions
-static int s_parent_thrd_pid = 0;
-static std::string_view s_progpath;
-static std::string_view s_progname;
-// getters for above static variabls
-inline int get_parent_pid() { return s_parent_thrd_pid; }
-__attribute__((noinline)) const char* progpath() { return s_progpath.data(); }
-__attribute__((noinline)) const std::string_view progname() { return s_progname; }
+static std::string_view sniffer_uds = "Sniffer_UDS";
+static std::string_view replier_uds = "Replier_UDS";
+static int s_parent_thread_pid = 0;
+static std::string_view s_prog_path;
+static std::string_view s_prog_name;
+// getters for above static variables
+inline int get_parent_pid() { return s_parent_thread_pid; }
+__attribute__((noinline)) const char* prog_path() { return s_prog_path.data(); }
+__attribute__((noinline)) const std::string_view prog_name() { return s_prog_name; }
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "LocalValueEscapesScope"
@@ -82,7 +74,7 @@ __attribute__((noinline)) const std::string_view progname() { return s_progname;
 #pragma ide diagnostic ignored "UnusedValue"
 #pragma ide diagnostic ignored "UnusedParameter"
 static void one_time_init(int argc, const char *argv[]) {
-  s_parent_thrd_pid = getpid();
+  s_parent_thread_pid = getpid();
 
   const char *malloced_tmpstr = nullptr;
 
@@ -92,23 +84,23 @@ static void one_time_init(int argc, const char *argv[]) {
       __assert("strdup() could not duplicate program full path name on startup", __FILE__, __LINE__);
       _exit(EXIT_FAILURE); // will exit here if __assert() defined to no-op function
     }
-    s_progpath = malloced_tmpstr; // static string_view variable takes ownership for program runtime duration
+    s_prog_path = malloced_tmpstr; // static string_view variable takes ownership for program runtime duration
   }
 
   {
     malloced_tmpstr = [](const char* const path) -> const char* {
       auto const dup_path = strdupa(path); // stack allocates the string storage (will go away on return)
       return strdup(basename(dup_path));   // heap allocates the string storage
-    }(progpath());
+    }(prog_path());
     if (malloced_tmpstr == nullptr) {
       __assert("strdup() could not duplicate program base name on startup", __FILE__, __LINE__);
       _exit(EXIT_FAILURE); // will exit here if __assert() defined to no-op function
     }
-    s_progname = malloced_tmpstr; // static string_view variable takes ownership for program runtime duration
+    s_prog_name = malloced_tmpstr; // static string_view variable takes ownership for program runtime duration
   }
 
-  static const auto uds_socket_name_sniff = make_uds_socket_name(progname(), "Sniffer_UDS");
-  static const auto uds_socket_name_reply = make_uds_socket_name(progname(), "Replier_UDS");
+  static const auto uds_socket_name_sniff = make_uds_socket_name(prog_name(), sniffer_uds);
+  static const auto uds_socket_name_reply = make_uds_socket_name(prog_name(), replier_uds);
 
   auto const sig_handler = [](int sig) {
     if (sig != SIGINT && sig != SIGTERM) return;
@@ -134,60 +126,16 @@ static void one_time_init(int argc, const char *argv[]) {
 
 int main(const int argc, const char *argv[]) {
   one_time_init(argc, argv);
-  auto const prn_usage = [prg=progname()] {
-    printf("Usage: %s [-sniff|netns_name] [-ping] destination_ip]\n", prg.data());
+  auto const prn_usage = [prg=prog_name()] {
+    printf("Usage: %s net_ns_name -ping destination_ip]\n", prg.data());
   };
 
-  if (argc < 2) {
+  if (argc < 4) {
     prn_usage();
-    return EXIT_FAILURE;
+    return argc == 1 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
-  const std::string_view arg1{argv[1]};
-  if (arg1 == "-sniff") {
-    std::string uds_socket_name_sniff;
-    std::string uds_socket_name_reply;
-    for(int i = 2; i < argc; i++) {
-      const std::string_view arg{argv[i]};
-      if (arg.starts_with("-pipe-sniff=")) {
-        auto delimiter = std::find(arg.begin(), arg.end(), '=');
-        delimiter++;
-        uds_socket_name_sniff = std::string(delimiter, arg.end());
-      } else if (arg.starts_with("-pipe-reply=")) {
-        auto delimiter = std::find(arg.begin(), arg.end(), '=');
-        delimiter++;
-        uds_socket_name_reply = std::string(delimiter, arg.end());
-      }
-    }
-    if (uds_socket_name_sniff.empty() || uds_socket_name_reply.empty()) {
-      fputs("ERROR: UDS socket names per options -pipe-sniff or -pipe-reply not detected", stderr);
-      return EXIT_FAILURE;
-    }
-    sockaddr_un sniff_addr{};
-    socklen_t sniff_addr_len;
-    sockaddr_un reply_addr{};
-    socklen_t reply_addr_len;
-    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff, sniff_addr, sniff_addr_len, true);
-    if (!socket_fd_sniff_sp_optn.has_value()) return EXIT_FAILURE;
-    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply, reply_addr, reply_addr_len);
-    if (!socket_fd_reply_sp_optn.has_value()) return EXIT_FAILURE;
-    auto socket_fd_sniff_sp = std::move(socket_fd_sniff_sp_optn.value());
-    auto socket_fd_reply_sp = std::move(socket_fd_reply_sp_optn.value());
-
-    std::function<int()> sniff_task =
-        [pipe_out = socket_fd_sniff_sp.release()->fd, addr = sniff_addr, addr_len = sniff_addr_len] {
-          return sniff(pipe_out, addr, addr_len);
-        };
-    std::function<int()> reply_task = [pipe_in=socket_fd_reply_sp.release()->fd]  { return reply(pipe_in);  };
-    std::future<int> fut1 = std::async(std::launch::async, std::move(sniff_task));
-    std::future<int> fut2 = std::async(std::launch::async, std::move(reply_task));
-
-    // wait on the task futures
-    const auto rc1 = fut1.get();
-    const auto rc2 = fut2.get();
-
-    return rc1 == EXIT_SUCCESS ? rc2 : rc1;
-  }
+  const std::string_view net_ns_arg{argv[1]};
 
   std::string_view dst_net_addr{""};
   {
@@ -215,12 +163,8 @@ int main(const int argc, const char *argv[]) {
     }
   }
 
-  auto ip_path_optn = find_program_path("ip", "PATH");
-  if (ip_path_optn->empty()) return EXIT_FAILURE;
-  const auto ip_path = ip_path_optn.value();
-
-  const auto uds_socket_name_sniff = make_uds_socket_name(progname(), "Sniffer_UDS");
-  const auto uds_socket_name_reply = make_uds_socket_name(progname(), "Replier_UDS");
+  const auto uds_socket_name_sniff = make_uds_socket_name(prog_name(), sniffer_uds);
+  const auto uds_socket_name_reply = make_uds_socket_name(prog_name(), replier_uds);
 
   const pid_t pid = fork();
   if (pid == -1) {
@@ -228,21 +172,64 @@ int main(const int argc, const char *argv[]) {
     return EXIT_FAILURE;
   } else if (pid == 0) {
     // child process
-    const char * const ip_prg = strdup(ip_path.data());
-    const char * const netns = strdup(arg1.data());
-    const char * const child_prg = strdup(progpath());
-    const auto pipe_sniff_optn = format2str("-pipe-sniff=%s", uds_socket_name_sniff.c_str());
-    const auto pipe_reply_optn = format2str("-pipe-reply=%s", uds_socket_name_reply.c_str());
-    const std::array<const char*, 9> child_argv =
-      { ip_prg, "netns", "exec", netns, child_prg, "-sniff", pipe_sniff_optn.c_str(), pipe_reply_optn.c_str(), nullptr };
+    std::string ns_path{"/var/run/netns/"};
+    ns_path += net_ns_arg;
 
-    // exec the program that will run as this child process (classic fork/exec)
-    int ec = execv(ip_prg, const_cast<char**>(child_argv.data()));
-    if (ec == -1) {
-      fprintf(stderr, "ERROR: pid(%d): failed to exec '%s': %s", getpid(), ip_prg, strerror(errno));
+    const int net_namespace_fd = open(ns_path.c_str(), O_RDONLY);
+    if (net_namespace_fd == -1) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: open(\"%s\", O_RDONLY): per forked child process (pid:%d): ec=%d; %s\n",
+              ns_path.c_str(), getpid(), ec, strerror(ec));
       return EXIT_FAILURE;
     }
-    return EXIT_SUCCESS;
+    auto const cleanup_fd = [](const int *p) {
+      if (p != nullptr) {
+        close(*p);
+      }
+    };
+    std::unique_ptr<const int, decltype(cleanup_fd)> net_ns_fd_sp{ &net_namespace_fd, cleanup_fd };
+
+    if (unshare(CLONE_NEWNET) == -1) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: unshare(..): per forked child process (pid:%d): ec=%d; %s\n", getpid(), ec, strerror(ec));
+      return EXIT_FAILURE;
+    }
+    if (setns(net_namespace_fd, CLONE_NEWNET) == -1) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: setns(..): per forked child process (pid:%d): ec=%d; %s\n", getpid(), ec, strerror(ec));
+      return EXIT_FAILURE;
+    }
+    if (mount("/proc/self/ns/net", ns_path.c_str(), "none", MS_BIND , nullptr) == -1) {
+      const auto ec = errno;
+      fprintf(stderr, "ERROR: mount(..) of \"%s\": per forked child process (pid:%d): ec=%d; %s\n",
+              ns_path.c_str(), getpid(), ec, strerror(ec));
+      return EXIT_FAILURE;
+    }
+
+    sockaddr_un sniff_addr{};
+    socklen_t sniff_addr_len;
+    sockaddr_un reply_addr{};
+    socklen_t reply_addr_len;
+    auto socket_fd_sniff_sp_optn = bind_uds_socket_name(uds_socket_name_sniff, sniff_addr, sniff_addr_len, true);
+    if (!socket_fd_sniff_sp_optn.has_value()) return EXIT_FAILURE;
+    auto socket_fd_reply_sp_optn = bind_uds_socket_name(uds_socket_name_reply, reply_addr, reply_addr_len);
+    if (!socket_fd_reply_sp_optn.has_value()) return EXIT_FAILURE;
+    auto socket_fd_sniff_sp = std::move(socket_fd_sniff_sp_optn.value());
+    auto socket_fd_reply_sp = std::move(socket_fd_reply_sp_optn.value());
+
+    std::function<int()> sniff_task =
+        [pipe_out = socket_fd_sniff_sp.release()->fd, addr = sniff_addr, addr_len = sniff_addr_len] {
+          return sniff(pipe_out, addr, addr_len);
+        };
+    std::function<int()> reply_task = [pipe_in=socket_fd_reply_sp.release()->fd]  { return reply(pipe_in);  };
+    std::future<int> fut1 = std::async(std::launch::async, std::move(sniff_task));
+    std::future<int> fut2 = std::async(std::launch::async, std::move(reply_task));
+
+    // wait on the task futures
+    const auto rc1 = fut1.get();
+    const auto rc2 = fut2.get();
+
+    return rc1 == EXIT_SUCCESS ? rc2 : rc1;
   } else {
     // parent process
     auto const wait_on_sniffer = [child_pid=pid, parent_pid=get_parent_pid()] {
@@ -296,102 +283,27 @@ int main(const int argc, const char *argv[]) {
   }
 }
 
-static std::string vformat2str(const char *const fmt, va_list ap) {
-  int strbuf_size = 256;
-  int n = strbuf_size;
-  char *strbuf = (char*) alloca(strbuf_size);
-  va_list parm_copy;
-  va_copy(parm_copy, ap);
-  {
-    n = vsnprintf(strbuf, (size_t) n, fmt, ap);
-    assert(n > 0);
-    if (n >= strbuf_size) {
-      strbuf = (char*) alloca(strbuf_size = ++n);
-      n = vsnprintf(strbuf, (size_t) n, fmt, parm_copy);
-      assert(n > 0 && n < strbuf_size);
-    }
-  }
-  va_end(parm_copy);
-  return strbuf; // returns std::string obj via Return Value Optimization
-}
-
-static std::string format2str(const char *const fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  auto rslt = vformat2str(fmt, ap);
-  va_end(ap);
-  return rslt; // returns std::string obj via Return Value Optimization
-}
-
-static std::string get_env_var(const std::string_view name) {
-  char * const val = getenv(name.data());
-  return val != nullptr ? std::string(val) : std::string();
-}
-
-static std::optional<std::string> find_program_path(const std::string_view prog, const std::string_view path_var_name) {
-  const auto path_env_var = get_env_var(path_var_name);
-
-  if (path_env_var.empty()) {
-    fprintf(stderr, "ERROR: there is no %s environment variable defined", path_var_name.data());
-    return std::nullopt;
-  }
-
-  const char * const path_env_var_dup = strdupa(path_env_var.c_str());
-
-  static const char * const delim = ":";
-  char *save = nullptr;
-  const char * path = strtok_r(const_cast<char*>(path_env_var_dup), delim, &save);
-
-  while(path != nullptr) {
-//    fprintf(stderr, "'%s'\n", path);
-    const auto len = strlen(path);
-    const char end_char = path[len - 1];
-    const char * const fmt = end_char == '/' ? "%s%s" : "%s/%s";
-    const auto full_path = format2str(fmt, path, prog.data());
-//    fprintf(stderr, "'%s'\n", full_path.c_str());
-    // check to see if program file path exist
-    struct stat statbuf{0};
-    if (stat(full_path.c_str(), &statbuf) != -1 && ((statbuf.st_mode & S_IFMT) == S_IFREG ||
-                                                    (statbuf.st_mode & S_IFMT) == S_IFLNK))
-    {
-      return full_path;
-    }
-    path = strtok_r(nullptr, delim, &save);
-  }
-
-  fprintf(stderr, "ERROR: could not locate program '%s' via %s environment variable", prog.data(), path_var_name.data());
-  return std::nullopt;
-}
-
 //
 // Utility function that makes a UDS (Unix Domain) socket name
 //
-static std::string make_uds_socket_name(const std::string_view progname, const std::string_view fifo_pipe_basename) {
+static std::string make_uds_socket_name(const std::string_view prg_name, const std::string_view fifo_pipe_basename) {
   const auto pid = getpid();
-  int strbuf_size = 256;
-  char *strbuf = reinterpret_cast<char *>(alloca(strbuf_size));
+  int str_buf_size = 256;
+  char *str_buf = reinterpret_cast<char *>(alloca(str_buf_size));
   do_msg_fmt:
   {
-    int n = strbuf_size;
-    n = snprintf(strbuf, static_cast<size_t>(n), "%s/%s_%s", "/tmp", progname.data(), fifo_pipe_basename.data());
+    int n = str_buf_size;
+    n = snprintf(str_buf, static_cast<size_t>(n), "%s/%s_%s", "/tmp", prg_name.data(), fifo_pipe_basename.data());
     if (n <= 0) {
       fprintf(stderr, "ERROR: %s() process %d Failed synthesizing FIFO_PIPE name string", __FUNCTION__, pid);
       return "";
     }
-    if (n >= strbuf_size) {
-      strbuf = reinterpret_cast<char *>(alloca(strbuf_size = ++n));
+    if (n >= str_buf_size) {
+      str_buf = reinterpret_cast<char *>(alloca(str_buf_size = ++n));
       goto do_msg_fmt; // try do_msg_fmt again
     }
   }
-  return strbuf;
-}
-
-static void fd_cleanup_with_delete(fd_wrapper_t *p) {
-  if (p != nullptr && p->fd != -1) {
-    close(p->fd);
-    p->fd = -1;
-  }
-  delete p;
+  return str_buf;
 }
 
 static int create_uds_socket() {
@@ -420,6 +332,14 @@ static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(
   // create the socket
   const int fd = create_uds_socket();
   if (fd < 0) return std::nullopt;
+
+  auto const fd_cleanup_with_delete = [](fd_wrapper_t *p) {
+    if (p != nullptr && p->fd != -1) {
+      close(p->fd);
+      p->fd = -1;
+    }
+    delete p;
+  };
   fd_wrapper_sp_t socket_fd_sp{ new fd_wrapper_t{ fd }, fd_cleanup_with_delete };
 
   init_sockaddr(uds_socket_name, addr, addr_len);
