@@ -26,6 +26,7 @@ limitations under the License.
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <optional>
+#include <sys/capability.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -44,6 +45,7 @@ extern int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len);
 extern int reply(int pipe_in);
 extern int tunnel(int pipe_in, const std::string_view dst_net_addr);
 extern int relay(int pipe_out, sockaddr_un addr, socklen_t addr_len);
+static std::optional<std::function<void()>> modify_cap(cap_value_t capability, cap_flag_value_t setting);
 static std::string make_uds_socket_name(const std::string_view prg_name, const std::string_view fifo_pipe_basename);
 
 // RAII-related declarations for managing file/pipe descriptors (to clean these up if exception thrown)
@@ -126,7 +128,7 @@ static void one_time_init(int argc, const char *argv[]) {
 
 int main(const int argc, const char *argv[]) {
   one_time_init(argc, argv);
-  auto const prn_usage = [prg=prog_name()] {
+  auto const prn_usage = [prg = prog_name()] {
     printf("Usage: %s net_ns_name -ping destination_ip]\n", prg.data());
   };
 
@@ -135,10 +137,25 @@ int main(const int argc, const char *argv[]) {
     return argc == 1 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
+  {
+    // this Linux capability will permit use of the Unix Domain Socket
+    // connections that are used by the tunl parent process and forked
+    // child process to communicate tunneled packets
+    auto rslt = modify_cap(CAP_NET_RAW, CAP_SET);
+    if (rslt.has_value()) {
+      rslt.value()(); // report error condition to stderr
+      fputs("ERROR: failed setting Linux capability CAP_NET_RAW; unable to use UDS connections\n", stderr);
+      return EXIT_FAILURE;
+    }
+  }
+
+  // argument #1 is the required command-line specified network namespace
   const std::string_view net_ns_arg{argv[1]};
 
   std::string_view dst_net_addr{""};
   {
+    // obtain the IPv4 network address specified via -ping command-line option
+    // and verify that it's a valid, reachable destination IP address
     for(int i = 2; i < argc; i++) {
       const std::string_view arg{argv[i]};
       if (arg == "-ping") {
@@ -163,6 +180,7 @@ int main(const int argc, const char *argv[]) {
     }
   }
 
+  // Unix Domain Socket names as used for parent process vis-à-vis child process communications
   const auto uds_socket_name_sniff = make_uds_socket_name(prog_name(), sniffer_uds);
   const auto uds_socket_name_reply = make_uds_socket_name(prog_name(), replier_uds);
 
@@ -171,10 +189,24 @@ int main(const int argc, const char *argv[]) {
     fprintf(stderr, "ERROR: pid(%d): fork() failed: %s\n", getpid(), strerror(errno));
     return EXIT_FAILURE;
   } else if (pid == 0) {
-    // child process
+    /***** child process *****/
+
+    // before can proceed to set the command-line specified network namespace
+    // for this child process, must have CAP_SYS_ADMIN capability
+    auto rslt = modify_cap(CAP_SYS_ADMIN, CAP_SET);
+    if (rslt.has_value()) {
+      rslt.value()(); // report error condition to stderr
+      fprintf(stderr, "ERROR: failed setting Linux capability CAP_SYS_ADMIN - can't access network namespace: \"%s\"\n",
+              net_ns_arg.data());
+      return EXIT_FAILURE;
+    }
+
+    // construct the network namespace full path
     std::string ns_path{"/var/run/netns/"};
     ns_path += net_ns_arg;
 
+    // open a file descriptor on the network namespace; leave
+    // open for duration of using the network namespace context
     const int net_namespace_fd = open(ns_path.c_str(), O_RDONLY);
     if (net_namespace_fd == -1) {
       const auto ec = errno;
@@ -189,16 +221,19 @@ int main(const int argc, const char *argv[]) {
     };
     std::unique_ptr<const int, decltype(cleanup_fd)> net_ns_fd_sp{ &net_namespace_fd, cleanup_fd };
 
+    // remove the parent-inherited network namespace context on this child process
     if (unshare(CLONE_NEWNET) == -1) {
       const auto ec = errno;
       fprintf(stderr, "ERROR: unshare(..): per forked child process (pid:%d): ec=%d; %s\n", getpid(), ec, strerror(ec));
       return EXIT_FAILURE;
     }
+    // switch this child process to the command-line specified network namespace
     if (setns(net_namespace_fd, CLONE_NEWNET) == -1) {
       const auto ec = errno;
       fprintf(stderr, "ERROR: setns(..): per forked child process (pid:%d): ec=%d; %s\n", getpid(), ec, strerror(ec));
       return EXIT_FAILURE;
     }
+    // make the command-line specified network namespace the default for this child process via mount()
     if (mount("/proc/self/ns/net", ns_path.c_str(), "none", MS_BIND , nullptr) == -1) {
       const auto ec = errno;
       fprintf(stderr, "ERROR: mount(..) of \"%s\": per forked child process (pid:%d): ec=%d; %s\n",
@@ -206,6 +241,10 @@ int main(const int argc, const char *argv[]) {
       return EXIT_FAILURE;
     }
 
+    // the sniff_task and the reply_task will now proceed to operate
+    // in the context of the command-line specified network namespace
+    // (they will use Unix Domain Sockets to communicate with the
+    //  original tunl parent process)
     sockaddr_un sniff_addr{};
     socklen_t sniff_addr_len;
     sockaddr_un reply_addr{};
@@ -225,15 +264,27 @@ int main(const int argc, const char *argv[]) {
     std::future<int> fut1 = std::async(std::launch::async, std::move(sniff_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(reply_task));
 
+    bool have_valid_shared_state = false;
+    for(int i = 5; i > 0; i--) {
+      if (have_valid_shared_state = fut1.valid() && fut2.valid(); have_valid_shared_state) break;
+      sleep(1);
+    }
+    if (!have_valid_shared_state) {
+      fprintf(stderr, "ERROR: sniff_task and reply_task of child process (pid=%d) have unexpectedly not started", getpid());
+      return EXIT_FAILURE;
+    }
+
     // wait on the task futures
     const auto rc1 = fut1.get();
     const auto rc2 = fut2.get();
 
     return rc1 == EXIT_SUCCESS ? rc2 : rc1;
   } else {
-    // parent process
-    auto const wait_on_sniffer = [child_pid=pid, parent_pid=get_parent_pid()] {
-      // now wait on the child process pid (which will call the sniff() function due the -sniff option)
+    /***** parent process *****/
+
+    // a lambda that implements waiting on the forked child process
+    std::function<int()> wait_on_sniffer_task = [child_pid=pid] {
+      // now wait on the child process pid (which will be executing the sniff_task and reply_task)
       int status = 0;
       do {
         if (waitpid(child_pid, &status, 0) == -1) {
@@ -246,11 +297,16 @@ int main(const int argc, const char *argv[]) {
         }
       } while (!WIFEXITED(status) && !WIFSIGNALED(status));
 
-      fprintf(stdout, "**** fork/exec terminating per child process (pid:%d); exit status: %d ****\n", child_pid, status);
+      fprintf(stdout, "**** termination of forked child process (pid:%d); exit status: %d ****\n", child_pid, status);
 
-      return status == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+      if (status != 0) _exit(EXIT_FAILURE);
+      return EXIT_SUCCESS;
     };
 
+    // the tunnel_task and relay_task will proceed to operate
+    // in the context of the default host network namespace
+    // (they will use Unix Domain Sockets to communicate with
+    //  the forked child process)
     sockaddr_un sniff_addr{};
     socklen_t sniff_addr_len;
     sockaddr_un reply_addr{};
@@ -262,10 +318,10 @@ int main(const int argc, const char *argv[]) {
     auto socket_fd_sniff_sp = std::move(socket_fd_sniff_sp_optn.value());
     auto socket_fd_reply_sp = std::move(socket_fd_reply_sp_optn.value());
 
-    // Initiate two async task:
-    //  1) wait on the child process (the invocation with -sniff option)
-    //  2) tunnel packets to outside world (as piped to and from the child process)
-    std::function<int()> wait_on_sniffer_task = wait_on_sniffer;
+    // Initiate three async task:
+    //  1) wait on the child process (which operates in the context of the command-line specified network namespace)
+    //  2) tunnel packets to outside world (as piped from the child process)
+    //  3) tunnel outside world packets back to the child process
     std::function<int()> tunnel_task =
         [pipe_in = socket_fd_sniff_sp.release()->fd, dst = dst_net_addr.data()] { return tunnel(pipe_in, dst); };
     std::function<int()> relay_task =
@@ -275,13 +331,65 @@ int main(const int argc, const char *argv[]) {
     std::future<int> fut1 = std::async(std::launch::async, std::move(wait_on_sniffer_task));
     std::future<int> fut2 = std::async(std::launch::async, std::move(tunnel_task));
     std::future<int> fut3 = std::async(std::launch::async, std::move(relay_task));
+
+    bool have_valid_shared_state = false;
+    for(int i = 5; i > 0; i--) {
+      if (have_valid_shared_state = fut1.valid() && fut2.valid() && fut3.valid(); have_valid_shared_state) break;
+      sleep(1);
+    }
+    if (!have_valid_shared_state) {
+      fprintf(stderr, "ERROR: worker task of parent process (pid=%d) have unexpectedly not started", getpid());
+      return EXIT_FAILURE;
+    }
+
     // wait on the task futures
     const auto rc1 = fut1.get();
     const auto rc2 = fut2.get();
-    const auto rc3 = fut2.get();
+    const auto rc3 = fut3.get();
     return rc1 == EXIT_SUCCESS ? (rc2 == EXIT_SUCCESS ? rc3 : rc2) : rc1;
   }
 }
+
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "ConstantParameter"
+/**
+ * Utility function for setting or clearing a Linux capability on the process of the caller.
+ *
+ * @param capability the Linux capability to be set or cleared
+ * @param setting enum that specifies whether to set or clear the capability
+ * @return empty optional on success; an error reporting lambda on failure
+ */
+static std::optional<std::function<void()>> modify_cap(cap_value_t capability, cap_flag_value_t setting) {
+  std::string_view fn{__FUNCTION__};
+  const std::array<cap_value_t, 1> cap_list{ capability };
+  cap_t const caps = cap_get_proc();
+  if (caps == nullptr) {
+    return [ec=errno, pfn=fn.data()]() {
+      fprintf(stderr, "ERROR: %s(..): call to cap_get_proc() failed: ec=%d; %s\n", pfn, ec, strerror(ec));
+    };
+  }
+  auto const clean_up = [](cap_t p) {
+    if (p != nullptr) {
+      cap_free(p);
+    }
+  };
+  std::unique_ptr<std::remove_pointer<cap_t>::type, decltype(clean_up)> caps_sp{caps, clean_up};
+
+  if (cap_set_flag(caps, CAP_EFFECTIVE, cap_list.size(), cap_list.data(), setting) == -1) {
+    return [ec=errno, pfn=fn.data()]() {
+      fprintf(stderr, "ERROR: %s(..): call to cap_set_flag(..) failed: ec=%d; %s\n", pfn, ec, strerror(ec));
+    };
+  }
+
+  if (cap_set_proc(caps) == -1) {
+    return [ec=errno, pfn=fn.data()]() {
+      fprintf(stderr, "ERROR: %s(..): call to cap_set_proc(..) failed: ec=%d; %s\n", pfn, ec, strerror(ec));
+    };
+  }
+
+  return std::nullopt;
+}
+#pragma clang diagnostic pop
 
 //
 // Utility function that makes a UDS (Unix Domain) socket name
