@@ -11,7 +11,7 @@ The program `tunl` is an exercise in network raw packet routing (via tunneling b
 
 The program is launched in the default network environment of the host computer, then it calls `fork()` to establish a child process. The child process establishes the command-line specified network namespace as its network.
 
-The `tunl` program requires the Linux capabilities `CAP_SYS_ADMIN` and `CAP_NET_RAW`. The `setcap` utility program is used to set these capabilities via this shell script:
+The `tunl` program requires the Linux capabilities `CAP_SYS_ADMIN` and `CAP_NET_RAW`. The `setcap` Linux utility program is used to set these capabilities via this shell script:
 
 ```sh
 # need to set Linux capabilities on tunl executable file (every time it's rebuilt)
@@ -25,7 +25,7 @@ The `tunl` program can then be executed like so:
 ./tunl my-netns-tst -ping 8.8.8.8 1> out.log 2>&1
 ```
 
-The first argument will be the name of a Linux namespace network (the project contains a script for creating that). More on the `-ping` argument later. Both `stdout` and `stderr` console logging output are being redirected to a log file, `out.log`; the `tail` tool can be used to view the log file as the `tunl` program executes. (Logging is not optimized in this program but log output to a file should be more efficient than writing to the console.)
+The first argument will be the name of a Linux namespace network (the project contains a script for creating that). More on the `-ping` argument later. Both `stdout` and `stderr` console logging output are being redirected to a log file, `out.log`; the `tail` tool can be used to view the log file as the `tunl` program executes. (Logging is not optimized in this program but log output to a file should be more efficient than writing synchronously to the console.)
 
 The upshot is that `tunl` runs two process instances of itself. The parent process will proceed to execute in the current, default network context. The child process will be executing in the network namespace context, called `my-netns-tst`.
 
@@ -43,7 +43,7 @@ ping: Warning: source address might be selected on device other than: lo
 PING 8.8.8.8 (8.8.8.8) from 0.0.0.0 lo: 56(84) bytes of data.
 ```
 
-The purpose of `tunl` is to sniff raw packets in the network namespace that `ping` is executing in, tunnel those packets to its parent process that runs in the default network, write those raw ICMP ECHO packets in the default network (where the IPv4 `8.8.8.8` address does exist and will respond with ICMP ECHOREPLY packets). The parent process reads the return ICMP ECHOREPLY raw packet, tunnels that to the child process, where the ICMP ECHOREPLY raw packet is written to the network namespace (`my-netns-tst` per the working example here).
+The purpose of `tunl` is to sniff raw packets in the network namespace that `ping` is executing in, tunnel those packets to its parent process that runs in the default network of the host computer, write those raw ICMP ECHO packets in the default network (where the IPv4 `8.8.8.8` address does exist and will respond with ICMP ECHOREPLY packets). The parent process reads the return ICMP ECHOREPLY raw packet, tunnels that to the child process, where the ICMP ECHOREPLY raw packet is written to the network namespace (`my-netns-tst` per the illustrative example here).
 
 The `ping` command will now see an ICMP ECHOREPLY and start writing acknowledgment to the console:
 
@@ -79,7 +79,7 @@ The **tunnel** task, running in the parent process, reads from said UDS socket, 
 
 The **relay** task, running in the parent process, reads raw packets from the default network, filtering for only ICMP packets. When it sees an ICMP ECHOREPLY packet, it writes that to a second UDS socket connection.
 
-The **reply** task, which is running in the child process, reads the raw ICMP ECHOREPLY packet from that second UDS socket connection, and then writes that raw packet into the network namespace (e.g., the `my-netns-tst` netns per this working example).
+The **reply** task, which is running in the child process, reads the raw ICMP ECHOREPLY packet from that second UDS socket connection, and then writes that raw packet into the network namespace (e.g., the `my-netns-tst` netns per this example).
 
 The `ping` command sees the raw ICMP ECHOREPLY packets written by the **reply** task and takes them to be the response to the ICMP ECHO packets that it has been dutifully emitting.
 
@@ -114,6 +114,8 @@ Sockets for writing raw packets are created thusly:
 ```C
 int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
 ```
+
+*NOTE: The Linux capability `CAP_NET_RAW` is required for invoking `socket()` with the `IPPROTO_RAW` protocol.*
 
 ## Linux network namespace scripts
 

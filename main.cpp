@@ -129,7 +129,7 @@ static void one_time_init(int argc, const char *argv[]) {
 int main(const int argc, const char *argv[]) {
   one_time_init(argc, argv);
   auto const prn_usage = [prg = prog_name()] {
-    printf("Usage: %s net_ns_name -ping destination_ip]\n", prg.data());
+    printf("Usage: %s net_ns_name -ping destination_ip\n", prg.data());
   };
 
   if (argc < 4) {
@@ -138,13 +138,15 @@ int main(const int argc, const char *argv[]) {
   }
 
   {
-    // this Linux capability will permit use of the Unix Domain Socket
-    // connections that are used by the tunl parent process and forked
-    // child process to communicate tunneled packets
+    // The CAP_NET_RAW Linux capability will permit invoking this call
+    // with the IPPROTO_RAW protocol:
+    //
+    // int dst_sock_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    //
     auto rslt = modify_cap(CAP_NET_RAW, CAP_SET);
     if (rslt.has_value()) {
       rslt.value()(); // report error condition to stderr
-      fputs("ERROR: failed setting Linux capability CAP_NET_RAW; unable to use UDS connections\n", stderr);
+      fputs("ERROR: failed setting Linux capability CAP_NET_RAW; can't create socket of IPPROTO_RAW protocol\n", stderr);
       return EXIT_FAILURE;
     }
   }
