@@ -31,6 +31,7 @@ limitations under the License.
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
+#include "spdlog/logger.h"
 
 static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
                           const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out);
@@ -39,19 +40,18 @@ static int print_icmp_packet(const long sequence, const std::span<char> buffer, 
 static void print_tcp_packet(const std::span<char> buffer);
 static void print_udp_packet(const std::span<char> buffer);
 
+extern std::shared_ptr<spdlog::logger> logger;
 static int tcp = 0, udp = 0, icmp = 0, others = 0, igmp = 0, total = 0;
 static auto c_start = std::chrono::high_resolution_clock::now();
 
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "UnusedParameter"
-int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
+int sniff(int pipe_out, sockaddr_un addr, [[maybe_unused]] socklen_t addr_len) {
   const std::string_view fn{__FUNCTION__};
-  printf("INFO: %s(..) invoked\n", fn.data());
+  logger->info("{}(..) invoked", fn.data());
 
   auto const cleanup_sockfd = [](const int* p) {
     if (p != nullptr) {
       close(*p);
-      printf("INFO: %s(..): close(__fd=%d) called\n", __FUNCTION__, *p);
+      logger->info("{}(..): close(__fd={}) called", __FUNCTION__, *p);
     }
   };
 
@@ -60,8 +60,8 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   for(;;) {
     if (connect(pipe_out, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == -1) {
       const auto ec = errno;
-      fprintf(stderr, "WARN: %s(..): connect(__fd=%d,addr=\"%s\",..): ec=%d; %s\n",
-              fn.data(), pipe_out, addr.sun_path, ec, strerror(ec));
+      logger->warn("{}(..): connect(__fd={},addr=\"{}\",..): ec={}; {}",
+                   fn.data(), pipe_out, addr.sun_path, ec, strerror(ec));
       sleep(3);
       continue;
     }
@@ -71,7 +71,7 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
   int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
   if (sockfd < 0) {
     const auto ec = errno;
-    fprintf(stderr, "ERROR: %s(..): socket(..): ec=%d; %s\n", fn.data(), ec, strerror(ec));
+    logger->error("{}(..): socket(..): ec={}; {}", fn.data(), ec, strerror(ec));
     return EXIT_FAILURE;
   }
   std::unique_ptr<int, decltype(cleanup_sockfd)> sp_sockfd{&sockfd, cleanup_sockfd};
@@ -91,7 +91,7 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
     struct timeval timeout = {3, 0}; // wait max 3 seconds for a reply
     for(bool is_first = true;;) {
       int rc = select(sockfd + 1, &read_set, nullptr, nullptr, &timeout);
-//      printf("DEBUG: %s(..): %d = select(..)\n", fn.data(), rc);
+//      logger->debug("{}(..): {} = select(..)", fn.data(), rc);
       if (rc == 0) {
         if (is_first) {
           fprintf(stdout, "INFO: %s(..): Got no packets\n", fn.data());
@@ -104,7 +104,7 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
           is_signal = true;
           break; // signal occurred
         }
-        fprintf(stderr, "ERROR: %s(..): select(..): ec=%d; %s\n", fn.data(), ec, strerror(ec));
+        logger->error("{}(..): select(..): ec={}; {}", fn.data(), ec, strerror(ec));
         return EXIT_FAILURE;
       }
 
@@ -113,21 +113,21 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
       socklen_t src_addr_len = 0;
       memset(data.data(), 0, sizeof(struct icmphdr));
       rc = recvfrom(sockfd, data.data(), data.size(), 0, &src_addr, &src_addr_len);
-//      printf("DEBUG: %s(..): %d = recvfrom(..)\n", fn.data(), rc);
+//      logger->debug("{}(..): {} = recvfrom(..)", fn.data(), rc);
       if (rc < 0) { // check and handle error condition
         const auto ec = errno;
-        fprintf(stderr, "ERROR: %s(..): recvfrom(__fd=%d,..): ec=%d; %s\n", fn.data(), sockfd, ec, strerror(ec));
+        logger->error("{}(..): recvfrom(__fd={},..): ec={}; {}", fn.data(), sockfd, ec, strerror(ec));
         return EXIT_FAILURE;
       } else if (rc > 0) {
         if (static_cast<size_t>(rc) < sizeof(struct iphdr)) {
-          fprintf(stderr, "WARN: %s(..): got too short raw packet: %d bytes (expected minimum iphdr %lu bytes)\n",
-                  fn.data(), rc, sizeof(struct iphdr));
+          logger->warn("{}(..): got too short raw packet: {} bytes (expected minimum iphdr {} bytes)",
+                       fn.data(), rc, sizeof(struct iphdr));
         } else {
           const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(data.data());
           const unsigned short icmp_pck_len = iph->ihl * 4 + sizeof(struct icmphdr);
           if (rc < icmp_pck_len) {
-            fprintf(stderr, "WARN: %s(..): got too short ICMP packet: %d bytes (expected minimum %u bytes)\n",
-                    fn.data(), rc, icmp_pck_len);
+            logger->error("{}(..): got too short ICMP packet: {} bytes (expected minimum {} bytes)",
+                          fn.data(), rc, icmp_pck_len);
           } else {
             if (process_packet(sequence, data, rc, sockfd, src_addr, src_addr_len, pipe_out) != EXIT_SUCCESS) {
               return EXIT_FAILURE;
@@ -142,7 +142,6 @@ int sniff(int pipe_out, sockaddr_un addr, socklen_t addr_len) {
 
   return EXIT_SUCCESS;
 }
-#pragma clang diagnostic pop
 
 static int process_packet(const long sequence, const std::span<char> buffer, const size_t packet_size, const int sockfd,
                           const sockaddr &src_addr, const socklen_t src_addr_len, const int pipe_out)
@@ -155,8 +154,8 @@ static int process_packet(const long sequence, const std::span<char> buffer, con
     case 1:  // ICMP Protocol
       ++icmp;
       if (static_cast<size_t>(packet_size) < sizeof(struct icmphdr)) { // check for truncated packet (would be unexpected)
-        fprintf(stderr, "ERROR: %s(..) recvfrom(__fd=%d,..): got short ICMP packet - %lu bytes (expected 'struct icmphdr' %u bytes)\n",
-                __FUNCTION__ , sockfd, packet_size, static_cast<unsigned int>(sizeof(struct icmphdr)));
+        logger->error("{}(..) recvfrom(__fd={},..): got short ICMP packet - {} bytes (expected 'struct icmphdr' {} bytes)",
+                      __FUNCTION__ , sockfd, packet_size, static_cast<unsigned int>(sizeof(struct icmphdr)));
       } else {
         rc = print_icmp_packet(sequence, buffer, packet_size, src_addr, src_addr_len, pipe_out);
       }
@@ -174,15 +173,15 @@ static int process_packet(const long sequence, const std::span<char> buffer, con
       break;
     default: // Some Other Protocol like ARP etc.
       ++others;
-      printf("Other packet protocol: %d\n", iph->protocol);
+      logger->warn("Other packet protocol: {}", iph->protocol);
       break;
   }
   const auto c_curr = std::chrono::high_resolution_clock::now();
   const auto diff = std::chrono::duration_cast<std::chrono::seconds>(c_curr - c_start).count();
   if (diff >= 15) { // every 15 seconds print out these totals
     c_start = c_curr;
-    fprintf(stdout, "INFO: sniff: TCP : %d   UDP : %d   ICMP : %d   IGMP : %d   Others : %d   Total : %d\n",
-           tcp, udp, icmp, igmp, others, total);
+    logger->info("sniff: TCP : {}   UDP : {}   ICMP : {}   IGMP : {}   Others : {}   Total : {}",
+                 tcp, udp, icmp, igmp, others, total);
   }
 
   return rc;
@@ -215,11 +214,14 @@ static int print_icmp_packet(const long sequence, const std::span<char> buffer, 
   const struct icmphdr * const icmph = reinterpret_cast<struct icmphdr *>(buffer.data() + iphdrlen);
   const auto type = static_cast<unsigned int>(icmph->type);
   const auto type_str = icmp_type_to_str(type);
-  fprintf(stdout, "INFO: sniff: ICMP Header | -Type : %u : %s\n", type, type_str.data());
+  logger->info("sniff: ICMP Header | -Type : {} : {}", type, type_str.data());
 
   if (type == ICMP_ECHOREPLY) {
-    fprintf(stdout, "INFO: sniff: ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)\n",
-            icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence);
+    std::array<char, 1024> strbuf{};
+    snprintf(strbuf.data(), strbuf.size(),
+             "sniff: ICMP Reply: icmphdr id=0x%X, icmphdr sequence=0x%X (%d); iteration sequence=0x%lX (%ld)",
+              icmph->un.echo.id, icmph->un.echo.sequence, icmph->un.echo.sequence, sequence, sequence);
+    logger->info(strbuf.data());
   } else if (type == ICMP_ECHO) {
     struct {
       const socklen_t addr_len;
@@ -235,7 +237,7 @@ static int print_icmp_packet(const long sequence, const std::span<char> buffer, 
     int rc = write(pipe_out, buf, total_buf_size);
     if (rc < 0) {
       const auto ec = errno;
-      fprintf(stderr, "ERROR: %s(..): write(__fd=%d..): ec=%d; %s\n", __FUNCTION__, pipe_out, ec, strerror(ec));
+      logger->error("{}(..): write(__fd={}..): ec={}; {}", __FUNCTION__, pipe_out, ec, strerror(ec));
       return EXIT_FAILURE;
     }
   }
@@ -247,21 +249,28 @@ static void print_tcp_packet(const std::span<char> buffer) {
   const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(buffer.data());
   const unsigned short iphdrlen = iph->ihl * 4;
   const struct tcphdr * const tcph = reinterpret_cast<struct tcphdr *>(buffer.data() + iphdrlen);
-  printf("INFO: sniff: TCP Header\n");
-  printf("   |-Source Port        : %u\n",ntohs(tcph->source));
-  printf("   |-Destination Port   : %u\n",ntohs(tcph->dest));
-  printf("   |-Sequence Number    : %u\n",ntohl(tcph->seq));
-  printf("   |-Acknowledge Number : %u\n",ntohl(tcph->ack_seq));
-  printf("   |-Header Length      : %u DWORDS or %u BYTES\n" ,
-         static_cast<unsigned int>(tcph->doff), static_cast<unsigned int>(tcph->doff * 4));
+  std::array<char, 2048> strbuf{};
+  snprintf(strbuf.data(), strbuf.size(),
+           "sniff: TCP Header\n"
+           "   |-Source Port        : %u\n"
+           "   |-Destination Port   : %u\n"
+           "   |-Sequence Number    : %u\n"
+           "   |-Acknowledge Number : %u\n"
+           "   |-Header Length      : %u DWORDS or %u BYTES",
+           ntohs(tcph->source), ntohs(tcph->dest), ntohl(tcph->seq), ntohl(tcph->ack_seq),
+           static_cast<unsigned int>(tcph->doff), static_cast<unsigned int>(tcph->doff * 4));
+  logger->info(strbuf.data());
 }
 
 static void print_udp_packet(const std::span<char> buffer) {
   const struct iphdr * const iph = reinterpret_cast<struct iphdr *>(buffer.data());
   const unsigned short iphdrlen = iph->ihl * 4;
   const struct udphdr * const udph = reinterpret_cast<struct udphdr *>(buffer.data() + iphdrlen);
-  printf("INFO: sniff: UDP Header\n");
-  printf("   |-Source Port      : %d\n" , ntohs(udph->source));
-  printf("   |-Destination Port : %d\n" , ntohs(udph->dest));
-  printf("   |-UDP Length       : %d\n" , ntohs(udph->len));
+  std::array<char, 2048> strbuf{};
+  snprintf(strbuf.data(), strbuf.size(),
+           "sniff: UDP Header\n"
+           "   |-Source Port      : %d\n"
+           "   |-Destination Port : %d\n"
+           "   |-UDP Length       : %d", ntohs(udph->source), ntohs(udph->dest), ntohs(udph->len));
+  logger->info(strbuf.data());
 }
