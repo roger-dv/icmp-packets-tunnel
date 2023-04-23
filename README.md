@@ -6,6 +6,8 @@ github username: roger-dv
 Copyright 2023 Roger D. Voss  
 Source code of this project is under Apache License, Version 2.0
 
+***NOTE:** Have introduced CPM in cmake `CMakeLists.txt` for managing package dependencies. Have used it to introduce spdlog and the source files have been refactored to use spdlog for logging output.*
+
 
 The program `tunl` is an exercise in network raw packet routing (via tunneling between two different network context).
 
