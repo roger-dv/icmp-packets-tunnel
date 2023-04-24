@@ -6,28 +6,33 @@ github username: roger-dv
 Copyright 2023 Roger D. Voss  
 Source code of this project is under Apache License, Version 2.0
 
-***NOTE:** Have introduced CPM in cmake `CMakeLists.txt` for managing package dependencies. Have used it to introduce spdlog and the source files have been refactored to use spdlog for logging output.*
+***NOTE:** Have introduced CPM in cmake `CMakeLists.txt` for managing package dependencies. Have used it to introduce `spdlog` and the source files have been refactored to use `spdlog` for logging output.*
 
+*Run program `tunl` without any command line options to see usage info.*
 
 The program `tunl` is an exercise in network raw packet routing (via tunneling between two different network context).
 
-The program is launched in the default network environment of the host computer, then it calls `fork()` to establish a child process. The child process establishes the command-line specified network namespace as its network.
+The program is launched in the default network environment of the host computer, then it calls `fork()` to establish a child process. The child process establishes the command-line specified network namespace as its network context.
 
 The `tunl` program requires the Linux capabilities `CAP_SYS_ADMIN` and `CAP_NET_RAW`. The `setcap` Linux utility program is used to set these capabilities via this shell script:
 
 ```sh
 # need to set Linux capabilities on tunl executable file (every time it's rebuilt)
-sudo scripts/set-capabilities.sh tunl
+sudo ./set-capabilities.sh tunl
 ```
 
 The `tunl` program can then be executed like so:
 
 
 ```sh
-./tunl my-netns-tst -ping 8.8.8.8 1> out.log 2>&1
+./tunl my-netns-tst -ping 8.8.8.8
 ```
 
-The first argument will be the name of a Linux namespace network (the project contains a script for creating that). More on the `-ping` argument later. Both `stdout` and `stderr` console logging output are being redirected to a log file, `out.log`; the `tail` tool can be used to view the log file as the `tunl` program executes. (Logging is not optimized in this program but log output to a file should be more efficient than writing synchronously to the console.)
+The first argument will be the name of a Linux network namespace (the project contains a script for creating that). More on the `-ping` argument later. If there are any errors encountered on program startup, they will be printed to `stderr`; subsequent logging (if any, as depending based on specified logging verbosity) will appear in these log files:
+```
+logs/tunl.log
+logs/tunl-child.log
+```
 
 The upshot is that `tunl` runs two process instances of itself. The parent process will proceed to execute in the current, default network context. The child process will be executing in the network namespace context, called `my-netns-tst`.
 
@@ -117,7 +122,7 @@ Sockets for writing raw packets are created thusly:
 int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
 ```
 
-*NOTE: The Linux capability `CAP_NET_RAW` is required for invoking `socket()` with the `IPPROTO_RAW` protocol.*
+***NOTE:** The Linux capability `CAP_NET_RAW` is required for invoking `socket()` with the `IPPROTO_RAW` protocol.*
 
 ## Linux network namespace scripts
 
@@ -131,7 +136,7 @@ scripts/delete-tst-netns.sh
 Both of these scripts must be invoked with `sudo` and passed the network namespace name as an argument, like so:
 
 ```sh
-sudo scripts/create-tst-netns.sh my-netns-tst
+sudo ./create-tst-netns.sh my-netns-tst
 ```
 
 Here are the contents of the create script:
@@ -183,11 +188,20 @@ ip netns delete "${NETNS_NAME}"
 ip netns list
 ```
 
-## Compiler used for building `tunl`
+## Compilers used for building `tunl`
 
-The compiler gcc/g++ version 12.1 was used to build the `tunl` project. This compiler has good C++17 compliance and significant support for C++20 (but is not complete, e.g., does not support format yet).
+The compiler gcc/g++ version 12.1 and clang++ version 16 were used to build the `tunl` project. These compiler versions have good C++17 compliance and significant support for C++20 (but are not complete, e.g., g++ does not support format yet).
 
-The `tunl` source code is C++17 compliant except for the use of `std::span`; it proved necessary to set the `-std=gnu++20` compiler option (refer to `CMakeLists.txt`) in order to use `std::span`.
+**NOTE:** On my computer I installed version 16 of clang/llvm from a downloaded `.tar.gz` file; per the directory as to where I *untarred* to, I then had to update these symbolic links to reference the version 16 clang shared libraries:
+```
+/lib/x86_64-linux-gnu/libc++.so.1.0
+/lib/x86_64-linux-gnu/libc++abi.so.1.0
+/lib/x86_64-linux-gnu/libunwind.so.1.0
+```
+
+*Despite insuring that `tunl` will dynamically link to the appropriate clang `libc++` version, there are link undefined symbol errors when specifying `-stdlib=libc++` (and even when insuring use of the clang/llvm `lld` linker). Thus currently it is necessary for a clang++ build to specify `-stdlib=libstdc++`.*
+
+The `tunl` source code is C++17 compliant except for the use of `std::span`; it proved necessary to set the `-std=c++20` compiler option (refer to `CMakeLists.txt`) in order to use `std::span`.
 
 The `tunl` program requires the use of `libcap` for its Linux capabilities API. The `libcap` package may need to be installed; this example is for Debian/Ubuntu distros:
 
