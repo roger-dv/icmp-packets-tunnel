@@ -62,8 +62,8 @@ static std::optional<fd_wrapper_sp_t> bind_uds_socket_name(
     const std::string_view uds_socket_name, sockaddr_un &addr, socklen_t &addr_len, const bool skip_bind = false);
 
 // static data definitions
-std::shared_ptr<spdlog::logger> logger;
-static std::shared_ptr<spdlog::logger> stderr_logger;
+std::shared_ptr<spdlog::logger> logger{};
+static std::shared_ptr<spdlog::logger> stderr_logger{};
 static std::string_view sniffer_uds = "Sniffer_UDS";
 static std::string_view replier_uds = "Replier_UDS";
 static int s_parent_thread_pid = 0;
@@ -155,7 +155,21 @@ static void one_time_init(int argc, const char *argv[]) {
 int main(const int argc, const char *argv[]) {
   one_time_init(argc, argv);
   auto const prn_usage = [prg = prog_name()] {
-    printf("Usage: %s net_ns_name -ping destination_ip\n", prg.data());
+    const char *const fmtstr = "Usage: %1$s net_ns_name -ping destination_ip [-v0|-v1|-v2]\n"
+                               "    (command line options must appear in order as shown)\n"
+                               "    net_ns_name            - network namespace that ping tool runs in context of\n"
+                               "    -ping destination_ip   - the same IP that ping tool attempts to target\n"
+                               "    -v0                    - file logging verbosity level of warn and error only\n"
+                               "    -v1                    - file logging verbosity of info, warn, and error (default)\n"
+                               "    -v2                    - file logging verbosity of -v1 but inclusive of debug level\n"
+                               "    (file logging will appear in: logs/%1$s.log logs/%1$s-child.log)\n"
+                               "\nUse scripts/set-capabilities.sh to enable necessary Linux capabilities, e.g.:\n"
+                               "\n    sudo ./set-capabilities.sh %1$s\n"
+                               "\nUse scripts/create-tst-netns.sh scripts/delete-tst-netns.sh for network namespace, e.g.:\n"
+                               "\n    sudo ./create-tst-netns.sh my-netns-tst\n"
+                               "\nRun ping tool in another shell instance, e.g.:\n"
+                               "\n    sudo ip netns exec my-netns-tst ping -I lo 8.8.8.8\n\n";
+    printf(fmtstr, prg.data());
   };
 
   if (argc < 4) {
@@ -179,6 +193,7 @@ int main(const int argc, const char *argv[]) {
 
   // argument #1 is the required command-line specified network namespace
   const std::string_view net_ns_arg{argv[1]};
+  spdlog::level::level_enum file_logging_level = spdlog::level::off;
 
   std::string_view dst_net_addr{""};
   {
@@ -200,11 +215,20 @@ int main(const int argc, const char *argv[]) {
           return EXIT_FAILURE;
         }
         i = j;
+      } else if (arg == "-v0" && file_logging_level == spdlog::level::off) {
+        file_logging_level = spdlog::level::warn;
+      } else if (arg == "-v1" && file_logging_level == spdlog::level::off) {
+        file_logging_level = spdlog::level::info;
+      } else if (arg == "-v2" && file_logging_level == spdlog::level::off) {
+        file_logging_level = spdlog::level::debug;
       }
     }
     if (dst_net_addr.empty()) {
       stderr_logger->error("destination IP address not specified");
       return EXIT_FAILURE;
+    }
+    if (file_logging_level == spdlog::level::off) {
+      file_logging_level = spdlog::level::info;
     }
   }
 
@@ -219,7 +243,7 @@ int main(const int argc, const char *argv[]) {
   } else if (pid == 0) {
     /***** child process *****/
     create_file_logger(std::string(prog_name()) + "-child");
-    logger->set_level(spdlog::level::debug);
+    logger->set_level(file_logging_level);
 
     // before can proceed to set the command-line specified network namespace
     // for this child process, must have CAP_SYS_ADMIN capability
@@ -316,7 +340,7 @@ int main(const int argc, const char *argv[]) {
   } else {
     /***** parent process *****/
     create_file_logger(prog_name());
-    logger->set_level(spdlog::level::debug);
+    logger->set_level(file_logging_level);
 
     // a lambda that implements waiting on the forked child process
     std::function<int()> wait_on_sniffer_task = [child_pid=pid] {
